@@ -42,7 +42,7 @@ vllm serve /mnt/share/weight/DeepSeek-V4-Flash \
   --api_server_count 1 \
   --speculative-config '{"num_speculative_tokens": 1,"method": "deepseek_mtp", "enforce_eager": true}' \
   --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/home/w00608002/vllm_profiling", "torch_profiler_with_stack": false}' \
-  --additional_config '{"enable_cpu_binding": "True", "multistream_overlap_shared_expert": true, "enable_qkv_pseudo_quant": true }' \
+  --additional_config '{"enable_cpu_binding": "True", "multistream_overlap_shared_expert": true, "enable_qkv_pseudo_quant": true, "enable_dsa_triton_decode": true }' \
   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
   # --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
   # --compilation-config '{"cudagraph_mode": "PIECEWISE"}'

@@ -42,6 +42,8 @@ Inputs mirror the reference / NPU op so callers can switch between
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -80,7 +82,7 @@ def _hif8_quant(x, scale):
         tl.where(abse <= 7.0, 2.0, tl.where(abse <= 15.0, 1.0, 0.0)),
     )
     res = tl.floor(x_unsigned * tl.exp2(-e + mant_bits) + 0.5) * tl.exp2(e - mant_bits) * sign
-    return res * scale  # TEMP: hif8 disabled to bisect vs ascendc (should be `res * scale`)
+    return res * scale  # dequant: undo the fixed per-tensor scale
 
 
 @triton.jit
@@ -93,6 +95,98 @@ def _e8m0_decode(scale_fp8):
     """
     bits = scale_fp8.to(tl.uint8, bitcast=True).to(tl.int32) << 23
     return bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _tile_score(
+    q_nope,  # [NOPE_DIM] fp32
+    q_rope,  # [ROPE_DIM] fp32
+    Nope_ptr, Rope_ptr, Scale_ptr, BT_ptr,
+    seq, t, j_start, valid_lo, valid_hi, softmax_scale_val,
+    stride_nope, stride_rope, stride_scale, stride_bt,
+    BLOCK_N: tl.constexpr, NOPE_DIM: tl.constexpr, ROPE_DIM: tl.constexpr,
+    SCALE_DIM: tl.constexpr, TILE_SIZE: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+):
+    """Load one contiguous KV tile, dequant, and compute Q@K^T*scale.
+
+    Tile token indices are ``j = j_start + t*BLOCK_N + arange(BLOCK_N)``; a token
+    is valid iff ``valid_lo <= j <= valid_hi`` (closed interval). Returns
+    ``(score[N], nope_dequant[N,NOPE], rope[N,ROPE], valid[N])``. Shared by the
+    SWA (ori) phase and the cmp_ratio=128 dense phase.
+    """
+    offs_bn = tl.arange(0, BLOCK_N)
+    offs_nope = tl.arange(0, NOPE_DIM)
+    offs_rope = tl.arange(0, ROPE_DIM)
+    j = j_start + t * BLOCK_N + offs_bn
+    valid = (j >= valid_lo) & (j <= valid_hi)
+    logical_block = j // BLOCK_SIZE
+    block_offset = j % BLOCK_SIZE
+    phys_block = tl.load(BT_ptr + seq * stride_bt + logical_block, mask=valid, other=0)
+    row = phys_block * BLOCK_SIZE + block_offset
+    nope = tl.load(
+        Nope_ptr + row[:, None] * stride_nope + offs_nope[None, :],
+        mask=valid[:, None], other=0.0,
+    ).to(tl.float32)
+    rope = tl.load(
+        Rope_ptr + row[:, None] * stride_rope + offs_rope[None, :],
+        mask=valid[:, None], other=0.0,
+    ).to(tl.float32)
+    scale_fp8 = tl.load(
+        Scale_ptr + row[:, None] * stride_scale + tl.arange(0, SCALE_DIM)[None, :],
+        mask=valid[:, None], other=0.0,
+    )
+    scale_fp32 = _e8m0_decode(scale_fp8)
+    scale_per_dim = tl.reshape(
+        tl.broadcast_to(scale_fp32[:, :, None], (BLOCK_N, SCALE_DIM, TILE_SIZE)),
+        (BLOCK_N, NOPE_DIM),
+    )
+    nope_dequant = nope * scale_per_dim
+    nope_score = tl.sum(q_nope[None, :] * nope_dequant, axis=1)
+    rope_score = tl.sum(q_rope[None, :] * rope, axis=1)
+    score = (nope_score + rope_score) * softmax_scale_val
+    score = tl.where(valid, score, -float("inf"))
+    return score, nope_dequant, rope, valid
+
+
+@triton.jit
+def _cmp4_token_score(
+    q_nope, q_rope,
+    Nope_ptr, Rope_ptr, Scale_ptr, BT_ptr, Idx_ptr,
+    seq, q_tok, k, valid_hi, softmax_scale_val,
+    stride_nope, stride_rope, stride_scale, stride_bt,
+    NOPE_DIM: tl.constexpr, ROPE_DIM: tl.constexpr, SCALE_DIM: tl.constexpr,
+    TILE_SIZE: tl.constexpr, TOPK: tl.constexpr, CMP_BLOCK_SIZE: tl.constexpr,
+):
+    """Load one cmp_ratio=4 top-k token (scalar), dequant, compute its score.
+
+    ``valid_hi`` is the inclusive causal upper bound (``(q_kv_pos+1)//4 - 1``).
+    Returns ``(score, nope_dequant[NOPE], rope[ROPE], valid)`` where the three
+    tensors are 1-D (single token).
+    """
+    idx = tl.load(Idx_ptr + q_tok * TOPK + k)
+    valid = (idx >= 0) & (idx <= valid_hi)
+    offs_nope = tl.arange(0, NOPE_DIM)
+    offs_rope = tl.arange(0, ROPE_DIM)
+    logical_block = idx // CMP_BLOCK_SIZE
+    block_offset = idx % CMP_BLOCK_SIZE
+    phys_block = tl.load(BT_ptr + seq * stride_bt + logical_block, mask=valid, other=0)
+    row = phys_block * CMP_BLOCK_SIZE + block_offset
+    nope = tl.load(Nope_ptr + row * stride_nope + offs_nope, mask=valid, other=0.0).to(tl.float32)
+    rope = tl.load(Rope_ptr + row * stride_rope + offs_rope, mask=valid, other=0.0).to(tl.float32)
+    scale_fp8 = tl.load(
+        Scale_ptr + row * stride_scale + tl.arange(0, SCALE_DIM), mask=valid, other=0.0,
+    )
+    scale_fp32 = _e8m0_decode(scale_fp8)
+    scale_per_dim = tl.reshape(
+        tl.broadcast_to(tl.reshape(scale_fp32, (SCALE_DIM, 1)), (SCALE_DIM, TILE_SIZE)),
+        (NOPE_DIM,),
+    )
+    nope_dequant = nope * scale_per_dim
+    nope_score = tl.sum(q_nope * nope_dequant, axis=0)
+    rope_score = tl.sum(q_rope * rope, axis=0)
+    score = (nope_score + rope_score) * softmax_scale_val
+    score = tl.where(valid, score, -float("inf"))
+    return score, nope_dequant, rope, valid
 
 
 @triton.jit
@@ -138,6 +232,7 @@ def _dsa_decode_kernel(
     MAX_CMP_TILES: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HIF8_SCALE: tl.constexpr,
+    ENABLE_HIF8: tl.constexpr,
 ):
     q_tok = tl.program_id(0)
     head = tl.program_id(1)
@@ -151,170 +246,163 @@ def _dsa_decode_kernel(
 
     offs_nope = tl.arange(0, NOPE_DIM)
     offs_rope = tl.arange(0, ROPE_DIM)
-    offs_bn = tl.arange(0, BLOCK_N)
 
     q_nope = tl.load(Q_ptr + q_tok * stride_q_t + head * stride_q_h + offs_nope).to(tl.float32)
     q_rope = tl.load(Q_ptr + q_tok * stride_q_t + head * stride_q_h + NOPE_DIM + offs_rope).to(tl.float32)
 
-    # Online softmax seeded with the learnable sink: m0 = sink, s0 = 1.
     sink = tl.load(Sinks_ptr + head)
-    m_i = tl.full([1], sink, dtype=tl.float32)
-    l_i = tl.full([1], 1.0, dtype=tl.float32)
-    acc_nope = tl.zeros([NOPE_DIM], dtype=tl.float32)
-    acc_rope = tl.zeros([ROPE_DIM], dtype=tl.float32)
 
     swa_start = tl.maximum(0, q_kv_pos - ORI_WIN_LEFT)
     swa_end = q_kv_pos  # inclusive (ori_win_right = 0)
+    ori_valid_hi = tl.minimum(swa_end, kv_len - 1)
+    cmp_excl_end = (q_kv_pos + 1) // CMP_RATIO  # exclusive causal upper bound
+    cmp4_valid_hi = cmp_excl_end - 1            # inclusive
 
-    # ------------------------------------------------------------------
-    # Phase 1: sliding-window attention over original KV (ori_mask_mode=4).
-    # ------------------------------------------------------------------
-    for t in range(MAX_ORI_TILES):
-        j = swa_start + t * BLOCK_N + offs_bn
-        valid = (j >= swa_start) & (j <= swa_end) & (j < kv_len)
-        logical_block = j // BLOCK_SIZE
-        block_offset = j % BLOCK_SIZE
-        phys_block = tl.load(
-            OriBT_ptr + seq * stride_ori_bt + logical_block,
-            mask=valid,
-            other=0,
-        )
-        row = phys_block * BLOCK_SIZE + block_offset  # flat token index
-        # ---- in-kernel dequant of one KV tile ----
-        nope = tl.load(
-            OriNope_ptr + row[:, None] * stride_ori_nope + offs_nope[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        rope = tl.load(
-            OriRope_ptr + row[:, None] * stride_ori_rope + offs_rope[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        # Load scale as fp8 (same storage) to dodge the broken uint8 vector
-        # load on triton-ascend, then recover the e8m0 byte via bitcast.
-        scale_fp8 = tl.load(
-            OriScale_ptr + row[:, None] * stride_ori_scale + tl.arange(0, SCALE_DIM)[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
-        scale_fp32 = _e8m0_decode(scale_fp8)
-        # Broadcast per-tile scale across each 64-dim tile: [N,7] -> [N,448].
-        scale_per_dim = tl.reshape(
-            tl.broadcast_to(scale_fp32[:, :, None], (BLOCK_N, SCALE_DIM, TILE_SIZE)),
-            (BLOCK_N, NOPE_DIM),
-        )
-        nope_dequant = nope * scale_per_dim
-
-        nope_score = tl.sum(q_nope[None, :] * nope_dequant, axis=1)  # [N]
-        rope_score = tl.sum(q_rope[None, :] * rope, axis=1)
-        score = (nope_score + rope_score) * softmax_scale_val
-        score = tl.where(valid, score, -float("inf"))
-
-        m_block = tl.max(score, axis=0)
-        m_new = tl.maximum(m_i, m_block)
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(score - m_new)
-        p = _hif8_quant(p, HIF8_SCALE)
-        p = tl.where(valid, p, 0.0)
-        l_i = l_i * alpha + tl.sum(p, axis=0)
-        acc_nope = acc_nope * alpha + tl.sum(p[:, None] * nope_dequant, axis=0)
-        acc_rope = acc_rope * alpha + tl.sum(p[:, None] * rope, axis=0)
-        m_i = m_new
-
-    # ------------------------------------------------------------------
-    # Phase 2: compressed KV (cmp_ratio in {4, 128}; 1 = skip).
-    # ------------------------------------------------------------------
-    cmp_excl_end = (q_kv_pos + 1) // CMP_RATIO  # exclusive upper bound
-
-    if CMP_RATIO == 4:
-        # Sparse: per-query-token top-k compressed-KV logical indices.
-        for k in range(TOPK):
-            idx = tl.load(CmpIdx_ptr + q_tok * TOPK + k)
-            valid = (idx >= 0) & (idx < cmp_excl_end)
-            logical_block = idx // CMP_BLOCK_SIZE
-            block_offset = idx % CMP_BLOCK_SIZE
-            phys_block = tl.load(
-                CmpBT_ptr + seq * stride_cmp_bt + logical_block,
-                mask=valid,
-                other=0,
+    if ENABLE_HIF8:
+        # ================================================================
+        # Two-pass GLOBAL HiF8 (matches the reference's materialized-exp hif8).
+        # Applying HiF8 per-tile inside online softmax does NOT commute with the
+        # running-max rescale (HiF8 is non-linear), so it stacks an extra
+        # quantization-noise term (~equal to the inherent hif8 error) on top.
+        # Instead we do an exact global hif8: pass 1 finds the joint rowmax,
+        # pass 2 applies hif8 to exp(score - rowmax) once. Cost: each KV tile is
+        # loaded/dequanted twice — acceptable on the decode path.
+        # ================================================================
+        # ---- Pass 1: joint rowmax, seeded with the sink. ----
+        m_final = sink
+        for t in range(MAX_ORI_TILES):
+            score, _, _, _ = _tile_score(
+                q_nope, q_rope, OriNope_ptr, OriRope_ptr, OriScale_ptr, OriBT_ptr,
+                seq, t, swa_start, swa_start, ori_valid_hi, softmax_scale_val,
+                stride_ori_nope, stride_ori_rope, stride_ori_scale, stride_ori_bt,
+                BLOCK_N, NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, BLOCK_SIZE,
             )
-            row = phys_block * CMP_BLOCK_SIZE + block_offset
-            nope = tl.load(CmpNope_ptr + row * stride_cmp_nope + offs_nope, mask=valid, other=0.0).to(tl.float32)
-            rope = tl.load(CmpRope_ptr + row * stride_cmp_rope + offs_rope, mask=valid, other=0.0).to(tl.float32)
-            scale_fp8 = tl.load(
-                CmpScale_ptr + row * stride_cmp_scale + tl.arange(0, SCALE_DIM),
-                mask=valid,
-                other=0.0,
+            m_final = tl.maximum(m_final, tl.max(score, axis=0))
+        if CMP_RATIO == 4:
+            for k in range(TOPK):
+                score, _, _, _ = _cmp4_token_score(
+                    q_nope, q_rope, CmpNope_ptr, CmpRope_ptr, CmpScale_ptr, CmpBT_ptr, CmpIdx_ptr,
+                    seq, q_tok, k, cmp4_valid_hi, softmax_scale_val,
+                    stride_cmp_nope, stride_cmp_rope, stride_cmp_scale, stride_cmp_bt,
+                    NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, TOPK, CMP_BLOCK_SIZE,
+                )
+                m_final = tl.maximum(m_final, score)
+        elif CMP_RATIO == 128:
+            cmp_len = kv_len // CMP_RATIO
+            c128_hi = tl.minimum(cmp_len, cmp_excl_end) - 1
+            for t in range(MAX_CMP_TILES):
+                score, _, _, _ = _tile_score(
+                    q_nope, q_rope, CmpNope_ptr, CmpRope_ptr, CmpScale_ptr, CmpBT_ptr,
+                    seq, t, 0, 0, c128_hi, softmax_scale_val,
+                    stride_cmp_nope, stride_cmp_rope, stride_cmp_scale, stride_cmp_bt,
+                    BLOCK_N, NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, CMP_BLOCK_SIZE,
+                )
+                m_final = tl.maximum(m_final, tl.max(score, axis=0))
+        # ---- Pass 2: weighted sum with hif8 on exp(score - m_final). ----
+        # l_i is seeded with the sink term exp(sink - m_final) (NOT hif8'd, same
+        # as the reference). No alpha rescale is needed: every tile shares the
+        # fixed m_final, so exp(score - m_final) is already on the global scale.
+        l_i = tl.exp(sink - m_final)
+        acc_nope = tl.zeros([NOPE_DIM], dtype=tl.float32)
+        acc_rope = tl.zeros([ROPE_DIM], dtype=tl.float32)
+        for t in range(MAX_ORI_TILES):
+            score, nope_dequant, rope, valid = _tile_score(
+                q_nope, q_rope, OriNope_ptr, OriRope_ptr, OriScale_ptr, OriBT_ptr,
+                seq, t, swa_start, swa_start, ori_valid_hi, softmax_scale_val,
+                stride_ori_nope, stride_ori_rope, stride_ori_scale, stride_ori_bt,
+                BLOCK_N, NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, BLOCK_SIZE,
             )
-            scale_fp32 = _e8m0_decode(scale_fp8)
-            scale_per_dim = tl.reshape(
-                tl.broadcast_to(tl.reshape(scale_fp32, (SCALE_DIM, 1)), (SCALE_DIM, TILE_SIZE)),
-                (NOPE_DIM,),
-            )
-            nope_dequant = nope * scale_per_dim
-            nope_score = tl.sum(q_nope * nope_dequant, axis=0)
-            rope_score = tl.sum(q_rope * rope, axis=0)
-            score = (nope_score + rope_score) * softmax_scale_val
-            score = tl.where(valid, score, -float("inf"))
-            m_new = tl.maximum(m_i, score)
-            alpha = tl.exp(m_i - m_new)
-            p = tl.exp(score - m_new)
-            p = _hif8_quant(p, HIF8_SCALE)
+            p = _hif8_quant(tl.exp(score - m_final), HIF8_SCALE)
             p = tl.where(valid, p, 0.0)
-            l_i = l_i * alpha + p
-            acc_nope = acc_nope * alpha + p * nope_dequant
-            acc_rope = acc_rope * alpha + p * rope
-            m_i = m_new
-    elif CMP_RATIO == 128:
-        # Dense: full scan over compressed KV tokens [0, cmp_len).
-        cmp_len = kv_len // CMP_RATIO
-        for t in range(MAX_CMP_TILES):
-            j = t * BLOCK_N + offs_bn
-            valid = (j < cmp_len) & (j < cmp_excl_end)
-            logical_block = j // CMP_BLOCK_SIZE
-            block_offset = j % CMP_BLOCK_SIZE
-            phys_block = tl.load(
-                CmpBT_ptr + seq * stride_cmp_bt + logical_block,
-                mask=valid,
-                other=0,
+            l_i = l_i + tl.sum(p, axis=0)
+            acc_nope = acc_nope + tl.sum(p[:, None] * nope_dequant, axis=0)
+            acc_rope = acc_rope + tl.sum(p[:, None] * rope, axis=0)
+        if CMP_RATIO == 4:
+            for k in range(TOPK):
+                score, nope_dequant, rope, valid = _cmp4_token_score(
+                    q_nope, q_rope, CmpNope_ptr, CmpRope_ptr, CmpScale_ptr, CmpBT_ptr, CmpIdx_ptr,
+                    seq, q_tok, k, cmp4_valid_hi, softmax_scale_val,
+                    stride_cmp_nope, stride_cmp_rope, stride_cmp_scale, stride_cmp_bt,
+                    NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, TOPK, CMP_BLOCK_SIZE,
+                )
+                p = _hif8_quant(tl.exp(score - m_final), HIF8_SCALE)
+                p = tl.where(valid, p, 0.0)
+                l_i = l_i + p
+                acc_nope = acc_nope + p * nope_dequant
+                acc_rope = acc_rope + p * rope
+        elif CMP_RATIO == 128:
+            cmp_len = kv_len // CMP_RATIO
+            c128_hi = tl.minimum(cmp_len, cmp_excl_end) - 1
+            for t in range(MAX_CMP_TILES):
+                score, nope_dequant, rope, valid = _tile_score(
+                    q_nope, q_rope, CmpNope_ptr, CmpRope_ptr, CmpScale_ptr, CmpBT_ptr,
+                    seq, t, 0, 0, c128_hi, softmax_scale_val,
+                    stride_cmp_nope, stride_cmp_rope, stride_cmp_scale, stride_cmp_bt,
+                    BLOCK_N, NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, CMP_BLOCK_SIZE,
+                )
+                p = _hif8_quant(tl.exp(score - m_final), HIF8_SCALE)
+                p = tl.where(valid, p, 0.0)
+                l_i = l_i + tl.sum(p, axis=0)
+                acc_nope = acc_nope + tl.sum(p[:, None] * nope_dequant, axis=0)
+                acc_rope = acc_rope + tl.sum(p[:, None] * rope, axis=0)
+    else:
+        # Single-pass online softmax (exact when hif8 is disabled). Seeded with
+        # the learnable sink: m0 = sink, s0 = 1.
+        m_i = tl.full([1], sink, dtype=tl.float32)
+        l_i = tl.full([1], 1.0, dtype=tl.float32)
+        acc_nope = tl.zeros([NOPE_DIM], dtype=tl.float32)
+        acc_rope = tl.zeros([ROPE_DIM], dtype=tl.float32)
+        for t in range(MAX_ORI_TILES):
+            score, nope_dequant, rope, valid = _tile_score(
+                q_nope, q_rope, OriNope_ptr, OriRope_ptr, OriScale_ptr, OriBT_ptr,
+                seq, t, swa_start, swa_start, ori_valid_hi, softmax_scale_val,
+                stride_ori_nope, stride_ori_rope, stride_ori_scale, stride_ori_bt,
+                BLOCK_N, NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, BLOCK_SIZE,
             )
-            row = phys_block * CMP_BLOCK_SIZE + block_offset
-            nope = tl.load(
-                CmpNope_ptr + row[:, None] * stride_cmp_nope + offs_nope[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            rope = tl.load(
-                CmpRope_ptr + row[:, None] * stride_cmp_rope + offs_rope[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            scale_fp8 = tl.load(
-                CmpScale_ptr + row[:, None] * stride_cmp_scale + tl.arange(0, SCALE_DIM)[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            )
-            scale_fp32 = _e8m0_decode(scale_fp8)
-            scale_per_dim = tl.reshape(
-                tl.broadcast_to(scale_fp32[:, :, None], (BLOCK_N, SCALE_DIM, TILE_SIZE)),
-                (BLOCK_N, NOPE_DIM),
-            )
-            nope_dequant = nope * scale_per_dim
-            nope_score = tl.sum(q_nope[None, :] * nope_dequant, axis=1)
-            rope_score = tl.sum(q_rope[None, :] * rope, axis=1)
-            score = (nope_score + rope_score) * softmax_scale_val
-            score = tl.where(valid, score, -float("inf"))
             m_block = tl.max(score, axis=0)
             m_new = tl.maximum(m_i, m_block)
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(score - m_new)
-            p = _hif8_quant(p, HIF8_SCALE)
             p = tl.where(valid, p, 0.0)
             l_i = l_i * alpha + tl.sum(p, axis=0)
             acc_nope = acc_nope * alpha + tl.sum(p[:, None] * nope_dequant, axis=0)
             acc_rope = acc_rope * alpha + tl.sum(p[:, None] * rope, axis=0)
             m_i = m_new
+        if CMP_RATIO == 4:
+            for k in range(TOPK):
+                score, nope_dequant, rope, valid = _cmp4_token_score(
+                    q_nope, q_rope, CmpNope_ptr, CmpRope_ptr, CmpScale_ptr, CmpBT_ptr, CmpIdx_ptr,
+                    seq, q_tok, k, cmp4_valid_hi, softmax_scale_val,
+                    stride_cmp_nope, stride_cmp_rope, stride_cmp_scale, stride_cmp_bt,
+                    NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, TOPK, CMP_BLOCK_SIZE,
+                )
+                m_new = tl.maximum(m_i, score)
+                alpha = tl.exp(m_i - m_new)
+                p = tl.exp(score - m_new)
+                p = tl.where(valid, p, 0.0)
+                l_i = l_i * alpha + p
+                acc_nope = acc_nope * alpha + p * nope_dequant
+                acc_rope = acc_rope * alpha + p * rope
+                m_i = m_new
+        elif CMP_RATIO == 128:
+            cmp_len = kv_len // CMP_RATIO
+            c128_hi = tl.minimum(cmp_len, cmp_excl_end) - 1
+            for t in range(MAX_CMP_TILES):
+                score, nope_dequant, rope, valid = _tile_score(
+                    q_nope, q_rope, CmpNope_ptr, CmpRope_ptr, CmpScale_ptr, CmpBT_ptr,
+                    seq, t, 0, 0, c128_hi, softmax_scale_val,
+                    stride_cmp_nope, stride_cmp_rope, stride_cmp_scale, stride_cmp_bt,
+                    BLOCK_N, NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, CMP_BLOCK_SIZE,
+                )
+                m_block = tl.max(score, axis=0)
+                m_new = tl.maximum(m_i, m_block)
+                alpha = tl.exp(m_i - m_new)
+                p = tl.exp(score - m_new)
+                p = tl.where(valid, p, 0.0)
+                l_i = l_i * alpha + tl.sum(p, axis=0)
+                acc_nope = acc_nope * alpha + tl.sum(p[:, None] * nope_dequant, axis=0)
+                acc_rope = acc_rope * alpha + tl.sum(p[:, None] * rope, axis=0)
+                m_i = m_new
     # CMP_RATIO == 1: compressed path skipped entirely.
 
     out_nope = (acc_nope / l_i).to(tl.bfloat16)
@@ -480,6 +568,16 @@ def kv_quant_sparse_attn_triton_decode(
         MAX_ORI_TILES=max_ori_tiles,
         MAX_CMP_TILES=max_cmp_tiles,
         BLOCK_N=block_n,
-        HIF8_SCALE=8.0,
+        # HiF8 per-tensor scale for the exp-score quantization. Default 8.0
+        # (matches the A8C4 reference). Override with the env var below to sweep
+        # scales: smaller scale -> exp scores land in HiF8's higher-precision
+        # exponent bands (p in (0,1], so scale=1.0 puts p/1 in (0,1] = e<=0,
+        # 3 mantissa bits, ~12.5% -> much finer than scale=8.0's e<=-3 band).
+        HIF8_SCALE=float(os.environ.get("VLLM_ASCEND_DSA_TRITON_HIF8_SCALE", "8.0")),
+        # Diagnostic switch: set VLLM_ASCEND_DSA_TRITON_P_HIF8=0 to bypass the
+        # in-kernel HiF8 quantization of exp scores (default "1" = enabled, the
+        # production A8C4 behavior). Used to isolate attention-logic errors from
+        # HiF8-application errors when bisecting against the ascend-c op.
+        ENABLE_HIF8=os.environ.get("VLLM_ASCEND_DSA_TRITON_P_HIF8", "1") != "0",
     )
     return out
