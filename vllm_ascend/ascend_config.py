@@ -166,6 +166,11 @@ class AscendConfig:
         self.enable_qkv_pseudo_quant = bool(additional_config.get("enable_qkv_pseudo_quant", False))
         self.kv_pseudo_quant_block_size = int(additional_config.get("kv_pseudo_quant_block_size", 32))
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))
+        # Route DSA decode attention through the Triton kernel
+        # (kv_quant_sparse_attn_triton) instead of the ascend-c op.
+        self.enable_dsa_triton_decode = bool(
+            additional_config.get("enable_dsa_triton_decode", False)
+        )
 
         self.enable_matmul_allreduce = self._get_config_value(
             additional_config,

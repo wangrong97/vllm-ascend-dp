@@ -80,6 +80,66 @@ def _triton_decode_c4(**kwargs):
     return triton_decode_dsa(**kwargs)
 
 
+def _dsa_triton_decode(
+    q,
+    ori_kv,
+    ori_block_table,
+    seqused_kv,
+    sinks,
+    softmax_scale,
+    compress_ratio,
+    cmp_kv=None,
+    cmp_block_table=None,
+    cmp_sparse_indices=None,
+    ori_block_size: int = 128,
+    cmp_block_size: int = 128,
+    ori_window_size: int = 128,
+    max_model_len: int = 0,
+    **kwargs,
+):
+    """Route DSA decode attention through the from-scratch Triton kernel
+    (vllm_ascend.attention.kv_quant_sparse_attn_triton), a port of
+    kv_quant_sparse_attn_sharedkv_reference with in-kernel fp8 dequant.
+
+    Enabled via additional_config.enable_dsa_triton_decode=true (mirrors
+    enable_qkv_pseudo_quant). Drop-in for the kv_quant_sparse_attn_sharedkv_pytorch
+    reference call site in _forward_decode.
+    """
+    from vllm_ascend.attention.kv_quant_sparse_attn_triton import (
+        kv_quant_sparse_attn_triton_decode,
+    )
+
+    num_seqs = seqused_kv.shape[0]
+    tokens_per_seq = q.shape[0] // num_seqs
+    if cmp_sparse_indices is not None:
+        logger.info_once(
+            "[DSA-TRITON] cmp_sparse_indices orig shape=%s dtype=%s",
+            tuple(cmp_sparse_indices.shape), cmp_sparse_indices.dtype,
+        )
+        # IndexCache returns cmp indices as [T, 1, K]; collapse to the 2D [T, K]
+        # the kernel indexes with q_tok * TOPK + k.
+        if cmp_sparse_indices.dim() > 2:
+            cmp_sparse_indices = cmp_sparse_indices.reshape(cmp_sparse_indices.shape[0], -1)
+    max_cmp_tokens = max(max_model_len // 128, 1) if compress_ratio == 128 else 0
+    return kv_quant_sparse_attn_triton_decode(
+        q=q,
+        ori_kv=ori_kv,
+        ori_block_table=ori_block_table,
+        seqused_kv=seqused_kv,
+        sinks=sinks,
+        softmax_scale=softmax_scale,
+        cmp_ratio=compress_ratio,
+        cmp_kv=cmp_kv,
+        cmp_block_table=cmp_block_table,
+        cmp_sparse_indices=cmp_sparse_indices,
+        ori_block_size=ori_block_size,
+        cmp_block_size=cmp_block_size,
+        ori_window_size=ori_window_size,
+        tokens_per_seq=tokens_per_seq,
+        max_cmp_tokens=max_cmp_tokens,
+    )
+
+
 def dsv4_dsa_overlap_stream() -> torch.npu.Stream:
     global _DSV4_DSA_OVERLAP_STREAM
     if _DSV4_DSA_OVERLAP_STREAM is None:
@@ -1447,6 +1507,11 @@ class AscendDSAImpl(DSAAttentionImpl):
         self.kv_pseudo_quant_block_size = int(
             getattr(ascend_config, "kv_pseudo_quant_block_size", 16)
         )
+        # Route DSA decode attention through the Triton kernel
+        # (kv_quant_sparse_attn_triton) instead of the ascend-c op.
+        self.enable_dsa_triton_decode = bool(
+            getattr(ascend_config, "enable_dsa_triton_decode", False)
+        )
         self.vllm_config = get_current_vllm_config()
 
         # indexer param
@@ -2453,13 +2518,13 @@ class AscendDSAImpl(DSAAttentionImpl):
         # DEBUG: log once per (compress_ratio, path) so we can confirm triton is
         # actually hit for each layer type, without flooding every decode step.
         global _DSA_TRITON_DECODE_LOGGED
-        _log_key = (self.compress_ratio, "triton" if use_triton_decode else "ascend-c")
+        _dsa_triton = use_triton_decode or self.enable_dsa_triton_decode
+        _log_key = (self.compress_ratio, "triton" if _dsa_triton else "ascend-c")
         if _log_key not in _DSA_TRITON_DECODE_LOGGED:
-            _enabled = _use_triton_decode()
-            if use_triton_decode:
+            if _dsa_triton:
                 _reason = "triton"
-            elif not _enabled:
-                _reason = "ascend-c (triton disabled: enabled=False)"
+            elif not (_use_triton_decode() or self.enable_dsa_triton_decode):
+                _reason = "ascend-c (triton disabled)"
             else:
                 _reason = (
                     f"ascend-c (triton skipped: num_decode_tokens="
@@ -2472,40 +2537,40 @@ class AscendDSAImpl(DSAAttentionImpl):
             _DSA_TRITON_DECODE_LOGGED.add(_log_key)
 
         if self.compress_ratio <= 1:
-            if use_triton_decode:
-                attn_output = _triton_decode_c4(
-                    q=q,
-                    swa_kv_cache=swa_kv_cache,
-                    compress_kv_cache=None,
-                    cmp_sparse_indices=None,
-                    ori_block_table=swa_decode_metadata.block_table,
-                    cmp_block_table=None,
-                    seqused_kv=actual_seq_lengths_key,
-                    sinks=self.attn_sink,
-                    softmax_scale=self.softmax_scale,
-                    compress_ratio=self.compress_ratio,
-                    ori_block_size=swa_decode_metadata.block_size,
-                    cmp_block_size=None,
-                    ori_window_size=self.window_size,
-                )
-            else:
-                attn_output = attn_op(
-                    q,
-                    ori_kv=swa_kv_cache,
-                    ori_block_table=swa_decode_metadata.block_table,
-                    cu_seqlens_q=actual_seq_lengths_query,
-                    seqused_kv=actual_seq_lengths_key,
-                    sinks=self.attn_sink,
-                    metadata=swa_decode_metadata.sas_metadata,
-                    softmax_scale=self.softmax_scale,
-                    cmp_ratio=max(self.compress_ratio, 1),
-                    ori_mask_mode=4,
-                    ori_win_left=self.window_size - 1,
-                    ori_win_right=0,
-                    layout_q="TND",
-                    layout_kv="PA_ND",
-                    **extra_attn_kwargs,
-                )[0]
+            # if use_triton_decode:
+            #     attn_output = _triton_decode_c4(
+            #         q=q,
+            #         swa_kv_cache=swa_kv_cache,
+            #         compress_kv_cache=None,
+            #         cmp_sparse_indices=None,
+            #         ori_block_table=swa_decode_metadata.block_table,
+            #         cmp_block_table=None,
+            #         seqused_kv=actual_seq_lengths_key,
+            #         sinks=self.attn_sink,
+            #         softmax_scale=self.softmax_scale,
+            #         compress_ratio=self.compress_ratio,
+            #         ori_block_size=swa_decode_metadata.block_size,
+            #         cmp_block_size=None,
+            #         ori_window_size=self.window_size,
+            #     )
+            # else:
+            attn_output = attn_op(
+                q,
+                ori_kv=swa_kv_cache,
+                ori_block_table=swa_decode_metadata.block_table,
+                cu_seqlens_q=actual_seq_lengths_query,
+                seqused_kv=actual_seq_lengths_key,
+                sinks=self.attn_sink,
+                metadata=swa_decode_metadata.sas_metadata,
+                softmax_scale=self.softmax_scale,
+                cmp_ratio=max(self.compress_ratio, 1),
+                ori_mask_mode=4,
+                ori_win_left=self.window_size - 1,
+                ori_win_right=0,
+                layout_q="TND",
+                layout_kv="PA_ND",
+                **extra_attn_kwargs,
+            )[0]
         elif self.compress_ratio == 4:
             # Optional Triton path: replace ascend-c attn_op with a triton
             # kernel when VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE=1.
@@ -2526,28 +2591,47 @@ class AscendDSAImpl(DSAAttentionImpl):
                     ori_window_size=self.window_size,
                 )
             else:
-                attn_output = attn_op(
-                # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
-                    q,
-                    ori_kv=swa_kv_cache,
-                    cmp_kv=compress_kv_cache,
-                    cmp_sparse_indices=compress_topk_idxs,
-                    ori_block_table=swa_decode_metadata.block_table,
-                    cmp_block_table=compressor_decode_metadata.block_table,
-                    cu_seqlens_q=actual_seq_lengths_query,
-                    seqused_kv=actual_seq_lengths_key,
-                    sinks=self.attn_sink,
-                    metadata=compressor_decode_metadata.sas_metadata,
-                    softmax_scale=self.softmax_scale,
-                    cmp_ratio=self.compress_ratio,
-                    ori_mask_mode=4,
-                    cmp_mask_mode=3,
-                    ori_win_left=self.window_size - 1,
-                    ori_win_right=0,
-                    layout_q="TND",
-                    layout_kv="PA_ND",
-                    **extra_attn_kwargs,
-                )[0]
+                if self.enable_dsa_triton_decode:
+                    logger.info_once(f"enable_dsa_triton_decode, compress_ratio = 4")
+                    attn_output = _dsa_triton_decode(
+                        q,
+                        ori_kv=swa_kv_cache,
+                        cmp_kv=compress_kv_cache,
+                        cmp_sparse_indices=compress_topk_idxs,
+                        ori_block_table=swa_decode_metadata.block_table,
+                        cmp_block_table=compressor_decode_metadata.block_table,
+                        seqused_kv=actual_seq_lengths_key,
+                        sinks=self.attn_sink,
+                        softmax_scale=self.softmax_scale,
+                        compress_ratio=self.compress_ratio,
+                        ori_block_size=swa_decode_metadata.block_size,
+                        cmp_block_size=compressor_decode_metadata.block_size,
+                        ori_window_size=self.window_size,
+                        max_model_len=self.vllm_config.model_config.max_model_len,
+                    )
+                else:
+                    attn_output = attn_op(
+                    # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
+                        q,
+                        ori_kv=swa_kv_cache,
+                        cmp_kv=compress_kv_cache,
+                        cmp_sparse_indices=compress_topk_idxs,
+                        ori_block_table=swa_decode_metadata.block_table,
+                        cmp_block_table=compressor_decode_metadata.block_table,
+                        cu_seqlens_q=actual_seq_lengths_query,
+                        seqused_kv=actual_seq_lengths_key,
+                        sinks=self.attn_sink,
+                        metadata=compressor_decode_metadata.sas_metadata,
+                        softmax_scale=self.softmax_scale,
+                        cmp_ratio=self.compress_ratio,
+                        ori_mask_mode=4,
+                        cmp_mask_mode=3,
+                        ori_win_left=self.window_size - 1,
+                        ori_win_right=0,
+                        layout_q="TND",
+                        layout_kv="PA_ND",
+                        **extra_attn_kwargs,
+                    )[0]
         else:
             # c128: full compressed KV scan (no sparse_indices).
             if use_triton_decode:
@@ -2567,27 +2651,46 @@ class AscendDSAImpl(DSAAttentionImpl):
                     ori_window_size=self.window_size,
                 )
             else:
-                attn_output = attn_op(
-                # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
-                    q,
-                    ori_kv=swa_kv_cache,
-                    cmp_kv=compress_kv_cache,
-                    ori_block_table=swa_decode_metadata.block_table,
-                    cmp_block_table=compressor_decode_metadata.block_table,
-                    cu_seqlens_q=actual_seq_lengths_query,
-                    seqused_kv=actual_seq_lengths_key,
-                    sinks=self.attn_sink,
-                    metadata=compressor_decode_metadata.sas_metadata,
-                    softmax_scale=self.softmax_scale,
-                    cmp_ratio=self.compress_ratio,
-                    ori_mask_mode=4,
-                    cmp_mask_mode=3,
-                    ori_win_left=self.window_size - 1,
-                    ori_win_right=0,
-                    layout_q="TND",
-                    layout_kv="PA_ND",
-                    **extra_attn_kwargs,
-                )[0]
+                if self.enable_dsa_triton_decode:
+                    logger.info_once(f"enable_dsa_triton_decode, compress_ratio = 128")
+                    attn_output = _dsa_triton_decode(
+                        q,
+                        ori_kv=swa_kv_cache,
+                        cmp_kv=compress_kv_cache,
+                        cmp_sparse_indices=None,
+                        ori_block_table=swa_decode_metadata.block_table,
+                        cmp_block_table=compressor_decode_metadata.block_table,
+                        seqused_kv=actual_seq_lengths_key,
+                        sinks=self.attn_sink,
+                        softmax_scale=self.softmax_scale,
+                        compress_ratio=self.compress_ratio,
+                        ori_block_size=swa_decode_metadata.block_size,
+                        cmp_block_size=compressor_decode_metadata.block_size,
+                        ori_window_size=self.window_size,
+                        max_model_len=self.vllm_config.model_config.max_model_len,
+                    )
+                else:
+                    attn_output = attn_op(
+                    # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
+                        q,
+                        ori_kv=swa_kv_cache,
+                        cmp_kv=compress_kv_cache,
+                        ori_block_table=swa_decode_metadata.block_table,
+                        cmp_block_table=compressor_decode_metadata.block_table,
+                        cu_seqlens_q=actual_seq_lengths_query,
+                        seqused_kv=actual_seq_lengths_key,
+                        sinks=self.attn_sink,
+                        metadata=compressor_decode_metadata.sas_metadata,
+                        softmax_scale=self.softmax_scale,
+                        cmp_ratio=self.compress_ratio,
+                        ori_mask_mode=4,
+                        cmp_mask_mode=3,
+                        ori_win_left=self.window_size - 1,
+                        ori_win_right=0,
+                        layout_q="TND",
+                        layout_kv="PA_ND",
+                        **extra_attn_kwargs,
+                    )[0]
         return attn_output
 
     def _indexer_qkv_prepare(
