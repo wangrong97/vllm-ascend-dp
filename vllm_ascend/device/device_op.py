@@ -33,6 +33,7 @@ from vllm_ascend.ops.triton.fla.solve_tril import solve_tril_16x16_kernel
 from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+from vllm.logger import logger
 
 DSA_COMPRESSOR_SLOT_MAPPING_FLAT = 1
 DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET = 2
@@ -1309,7 +1310,9 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
     @staticmethod
     def indexer_quantize_query(q):
         """Quantize indexer query. A5: fp8 quant, no extra scale conversion."""
+        logger.info_once(f"indexer_quantize_query before quant q.dtype:{q.dtype}")
         q_quant, q_scale = torch_npu.npu_dynamic_quant(q, dst_type=torch.float8_e4m3fn)
+        logger.info_once(f"indexer_quantize_query after quant q_quant.dtype:{q_quant.dtype}, q_scale.dtype:{q_scale.dtype}")
         return q_quant, q_scale
 
     @staticmethod

@@ -36,6 +36,13 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
+# Pseudo-quantization helpers for DSA attention inputs (experimental).
+from vllm_ascend.attention.pseudo_quant import (
+    pseudo_quantize_fp4_per_block,
+    pseudo_quantize_hif8_per_tensor_fixed_scale,
+)
+from vllm.logger import logger
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -1411,6 +1418,14 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         ascend_config = get_ascend_config()
         self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
+        # Experimental pseudo-quantization of q/kv before DSA attention.
+        # Enabled via additional_config.enable_qkv_pseudo_quant=true.
+        self.enable_qkv_pseudo_quant = bool(
+            getattr(ascend_config, "enable_qkv_pseudo_quant", False)
+        )
+        self.kv_pseudo_quant_block_size = int(
+            getattr(ascend_config, "kv_pseudo_quant_block_size", 16)
+        )
         self.vllm_config = get_current_vllm_config()
 
         # indexer param
@@ -1821,6 +1836,10 @@ class AscendDSAImpl(DSAAttentionImpl):
             rotary_mode="interleave",
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
+        # # Experimental: pseudo-quantize Q before sparse attention. The output
+        # # remains bf16 so the existing attention kernel needs no change.
+        # if self.enable_qkv_pseudo_quant:
+        #     q = pseudo_quantize_hif8_per_token(q)
 
         return q, qr, qr_pertoken_scale
 
@@ -1932,6 +1951,11 @@ class AscendDSAImpl(DSAAttentionImpl):
             # swa exec kv
             DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_prefill_metadata.slot_mapping)
 
+        # Experimental: pseudo-quantize Q before sparse attention. The output
+        # remains bf16 so the existing attention kernel needs no change.
+        if self.enable_qkv_pseudo_quant:
+            q = pseudo_quantize_hif8_per_tensor_fixed_scale(q, scale=8.0)
+
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
         DeviceOperator.add_dsa_sparse_attn_extra_kwargs(extra_attn_kwargs, cu_seqlens_ori_kv=actual_seq_lengths_query)
@@ -2037,6 +2061,12 @@ class AscendDSAImpl(DSAAttentionImpl):
             # A zero-row compressor output has no KV writes. Skip scatter
             # instead of passing None; A5 scatter dereferences x.view().
             if compressed_kv.shape[0] > 0:
+                # Experimental: pseudo-quantize compressed KV before writing it
+                # to the cache so later reads observe the quantized values.
+                if self.enable_qkv_pseudo_quant:
+                    compressed_kv = pseudo_quantize_fp4_per_block(
+                        compressed_kv, block_size=self.kv_pseudo_quant_block_size
+                    )
                 DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
 
             if self.multistream_dsv4_dsa_overlap and self.compress_ratio == 4 and not self.skip_topk:
@@ -2249,6 +2279,11 @@ class AscendDSAImpl(DSAAttentionImpl):
             # swa exec kv
             DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_decode_metadata.slot_mapping)
 
+        # Experimental: pseudo-quantize Q before sparse attention. The output
+        # remains bf16 so the existing attention kernel needs no change.
+        if self.enable_qkv_pseudo_quant:
+            q = pseudo_quantize_hif8_per_tensor_fixed_scale(q, scale=8.0)
+
         if self.compress_ratio > 1:
             compressor_decode_metadata = _require_decode_metadata(compressor_attn_metadata)
             compressor_state_decode_metadata = _require_decode_metadata(compressor_kv_state_metadata)
@@ -2328,6 +2363,12 @@ class AscendDSAImpl(DSAAttentionImpl):
             # A zero-row compressor output has no KV writes. Skip scatter
             # instead of passing None; A5 scatter dereferences x.view().
             if compressed_kv.shape[0] > 0:
+                # Experimental: pseudo-quantize compressed KV before writing it
+                # to the cache so later reads observe the quantized values.
+                if self.enable_qkv_pseudo_quant:
+                    compressed_kv = pseudo_quantize_fp4_per_block(
+                        compressed_kv, block_size=self.kv_pseudo_quant_block_size
+                    )
                 DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
 
             if self.multistream_dsv4_dsa_overlap and self.compress_ratio == 4 and not self.skip_topk:

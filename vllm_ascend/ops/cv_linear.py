@@ -3,6 +3,7 @@
 #
 import torch
 import torch_npu
+from vllm.logger import logger
 
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 
@@ -105,6 +106,7 @@ class CVLinearWrapper:
         if self._has_communication:
             return self.linear.forward(quantized_x)
 
+        logger.info_once(f"self._is_w8a8_dynamic: {self._is_w8a8_dynamic}")
         if self._is_w8a8_dynamic:
             need_unsqz = False
             if pertoken_scale is not None and pertoken_scale.dim() == 2:

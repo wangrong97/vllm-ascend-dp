@@ -162,6 +162,9 @@ class AscendConfig:
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
         self.enable_sleep_mode_extra_cleanup = additional_config.get("enable_sleep_mode_extra_cleanup", False)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", True)
+        # Experimental pseudo-quantization of q/kv before DSA attention.
+        self.enable_qkv_pseudo_quant = bool(additional_config.get("enable_qkv_pseudo_quant", False))
+        self.kv_pseudo_quant_block_size = int(additional_config.get("kv_pseudo_quant_block_size", 32))
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))
 
         self.enable_matmul_allreduce = self._get_config_value(
