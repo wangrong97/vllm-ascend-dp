@@ -19,6 +19,7 @@ from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_decodes_and_prefills
+from vllm_ascend.compilation.breakable_acl_graph import eager_break_during_capture
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_otp_group
@@ -1690,6 +1691,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             output[...] = self.wo_b(o_proj_input)
         return output
 
+    @eager_break_during_capture
     def forward(  # type: ignore[override]
         self,
         layer_name,

@@ -1,4 +1,4 @@
-curl http://localhost:9000/v1/chat/completions \
+curl http://localhost:9001/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
         "model": "dsv",

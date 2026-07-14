@@ -13,10 +13,16 @@ export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HCCL_BUFFSIZE=1024
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
+
+# Keep attention (DSA) out of the ACL graph: capture the FULL decode graph in
+# segments split at every attention forward; each attention runs eagerly
+# between captured segments. Decode + prefill are both covered (prefill
+# already runs eager, so this mainly affects the FULL decode graph).
+# export VLLM_ASCEND_ATTN_EAGER_BREAK=1
 
 # vllm serve /mnt/share/weight/dsk_v4-flash-w8a8_mxfp-smooth-0707-full
-vllm serve /home/weight/DeepSeek-V4-Flash \
+vllm serve /mnt/share/weight/DeepSeek-V4-Flash \
   --max_model_len 135000 \
   --safetensors-load-strategy 'prefetch' \
   --max-num-batched-tokens 4096  \
@@ -25,7 +31,7 @@ vllm serve /home/weight/DeepSeek-V4-Flash \
   --enable-expert-parallel \
   --async-scheduling \
   --max-num-seqs 64 \
-  --port 9000 \
+  --port 9001 \
   --block-size 128 \
   --no-enable-prefix-caching \
   --tokenizer-mode deepseek_v4 \
@@ -35,9 +41,9 @@ vllm serve /home/weight/DeepSeek-V4-Flash \
   --data-parallel-size 4 \
   --api_server_count 1 \
   --speculative-config '{"num_speculative_tokens": 1,"method": "deepseek_mtp", "enforce_eager": true}' \
-  --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/home/yuanlinfeng/vllm_profiling", "torch_profiler_with_stack": false}' \
+  --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/home/w00608002/vllm_profiling", "torch_profiler_with_stack": false}' \
   --additional_config '{"enable_cpu_binding": "True", "multistream_overlap_shared_expert": true, "enable_qkv_pseudo_quant": true }' \
-  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
   # --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
   # --compilation-config '{"cudagraph_mode": "PIECEWISE"}'
   # --enforce-eager \

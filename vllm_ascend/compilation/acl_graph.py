@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -23,6 +24,7 @@ from vllm.platforms import current_platform
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
 from ..utils import weak_ref_tensors
+from .breakable_acl_graph import BreakableACLGraphCapture
 
 _acl_graph_wrappers: weakref.WeakSet[Any] = weakref.WeakSet()
 _STREAM_RESOURCE_ERROR_CODE = "207008"
@@ -126,6 +128,10 @@ class ACLGraphWrapper:
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
+        # When enabled (VLLM_ASCEND_ATTN_EAGER_BREAK=1), capture the FULL graph
+        # in segments split at every @eager_break_during_capture point, so that
+        # attention runs eagerly out of the ACL graph. See breakable_acl_graph.py.
+        self.use_breakable = os.getenv("VLLM_ASCEND_ATTN_EAGER_BREAK", "0") == "1"
         _acl_graph_wrappers.add(self)
 
         ACLGraphWrapper._all_instances.add(self)
@@ -204,23 +210,42 @@ class ACLGraphWrapper:
 
                 get_offloader().sync_prev_onload()
                 forward_context.capturing = True
+                captured = None  # NPUGraph or BreakableACLGraphCapture
                 try:
-                    with torch.npu.graph(aclgraph, pool=self.graph_pool):
-                        # `output` is managed by pytorch's aclgraph pool
-                        output = self.runnable(*args, **kwargs)
-                        # Join offloader's copy stream after forward to avoid
-                        # unjoined stream error. The last layer's start_prefetch
-                        # forks copy_stream, but wait_prefetch only happens in
-                        # the next forward pass.
-                        get_offloader().join_after_forward()
-                        if self.aclgraph_options.weak_ref_output:
-                            # by converting it to weak ref,
-                            # the original `output` will immediately be released
-                            # to save memory. It is only safe to do this for
-                            # the last graph in piecewise aclgraph mode, because
-                            # the output of the last graph will not be used by
-                            # any other acl graph.
-                            output = weak_ref_tensors(output)
+                    if self.use_breakable:
+                        # Capture in segments split at every attention forward
+                        # (@eager_break_during_capture); attention runs eagerly
+                        # between captured segments, staying out of the ACL graph.
+                        capture = BreakableACLGraphCapture(pool=self.graph_pool)
+                        with capture:
+                            output = self.runnable(*args, **kwargs)
+                            get_offloader().join_after_forward()
+                            if self.aclgraph_options.weak_ref_output:
+                                output = weak_ref_tensors(output)
+                        logger.info_once(
+                            "Captured breakable ACL graph for %s: %r",
+                            entry.batch_descriptor,
+                            capture,
+                        )
+                        captured = capture
+                    else:
+                        with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                            # `output` is managed by pytorch's aclgraph pool
+                            output = self.runnable(*args, **kwargs)
+                            # Join offloader's copy stream after forward to avoid
+                            # unjoined stream error. The last layer's start_prefetch
+                            # forks copy_stream, but wait_prefetch only happens in
+                            # the next forward pass.
+                            get_offloader().join_after_forward()
+                            if self.aclgraph_options.weak_ref_output:
+                                # by converting it to weak ref,
+                                # the original `output` will immediately be released
+                                # to save memory. It is only safe to do this for
+                                # the last graph in piecewise aclgraph mode, because
+                                # the output of the last graph will not be used by
+                                # any other acl graph.
+                                output = weak_ref_tensors(output)
+                        captured = aclgraph
                 except RuntimeError as exc:
                     if _is_stream_resource_capture_error(exc):
                         _raise_stream_resource_capture_error(exc)
@@ -238,7 +263,7 @@ class ACLGraphWrapper:
             # here we always use weak ref for the output
             # to save memory
             entry.output = weak_ref_tensors(output)
-            entry.aclgraph = aclgraph
+            entry.aclgraph = captured
 
             compilation_counter.num_cudagraph_captured += 1
 

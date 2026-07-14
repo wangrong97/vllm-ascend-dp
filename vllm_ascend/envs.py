@@ -119,6 +119,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Directory containing decode_c4_triton.py for the experimental DSA
     # Triton decode path. The default is unset; this is not sensitive.
     "VLLM_ASCEND_DSA_TRITON_KERNEL_PATH": lambda: os.getenv("VLLM_ASCEND_DSA_TRITON_KERNEL_PATH", None),
+    # Keep attention out of the ACL graph. When enabled ("1"), the FULL decode
+    # graph is captured in segments split at every attention forward; each
+    # attention runs eagerly between captured segments (GEMM/RMSNorm/MoE stay
+    # captured). Covers both decode and prefill. See
+    # vllm_ascend/compilation/breakable_acl_graph.py.
+    "VLLM_ASCEND_ATTN_EAGER_BREAK": lambda: bool(int(os.getenv("VLLM_ASCEND_ATTN_EAGER_BREAK", "0"))),
 }
 
 # end-env-vars-definition
