@@ -41,6 +41,7 @@ from vllm_ascend.attention.pseudo_quant import (
     pseudo_quantize_fp4_per_block,
     pseudo_quantize_hif8_per_tensor_fixed_scale,
 )
+from vllm_ascend.attention.kv_quant_sparse_attn_sharedkv_reference import kv_quant_sparse_attn_sharedkv_pytorch
 from vllm.logger import logger
 
 if TYPE_CHECKING:
@@ -2064,10 +2065,12 @@ class AscendDSAImpl(DSAAttentionImpl):
                 # Experimental: pseudo-quantize compressed KV before writing it
                 # to the cache so later reads observe the quantized values.
                 if self.enable_qkv_pseudo_quant:
+                    # logger.info_once(f"prefill compressed_kv.dtype:{compressed_kv.dtype}, compressed_kv.shape:{compressed_kv.shape}")
                     compressed_kv = pseudo_quantize_fp4_per_block(
                         compressed_kv, block_size=self.kv_pseudo_quant_block_size
                     )
                 DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
+                # logger.info_once(f"prefill after cache compressed_kv.dtype:{compressed_kv.dtype}, compressed_kv.shape:{compressed_kv.shape}")
 
             if self.multistream_dsv4_dsa_overlap and self.compress_ratio == 4 and not self.skip_topk:
                 # Wait aux_stream weights_proj done, then compute dot
@@ -2108,6 +2111,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                 DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
                     extra_attn_kwargs, cu_seqlens_cmp_kv=common_prefill_metadata.cu_c4_cmp_seqlen_list
                 )
+                
+                # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
                 attn_output = attn_op(
                     q,
                     ori_kv=swa_kv_cache,
@@ -2133,6 +2138,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
                     extra_attn_kwargs, cu_seqlens_cmp_kv=common_prefill_metadata.cu_c128_cmp_seqlen_list
                 )
+                # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
                 attn_output = attn_op(
                     q,
                     ori_kv=swa_kv_cache,
@@ -2366,10 +2372,12 @@ class AscendDSAImpl(DSAAttentionImpl):
                 # Experimental: pseudo-quantize compressed KV before writing it
                 # to the cache so later reads observe the quantized values.
                 if self.enable_qkv_pseudo_quant:
+                    # logger.info_once(f"decode compressed_kv.dtype:{compressed_kv.dtype}, compressed_kv.shape:{compressed_kv.shape}")
                     compressed_kv = pseudo_quantize_fp4_per_block(
                         compressed_kv, block_size=self.kv_pseudo_quant_block_size
                     )
                 DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
+                # logger.info_once(f"decode after cache compressed_kv.dtype:{compressed_kv.dtype}, compressed_kv.shape:{compressed_kv.shape}")
 
             if self.multistream_dsv4_dsa_overlap and self.compress_ratio == 4 and not self.skip_topk:
                 # Wait aux_stream weights_proj done
@@ -2429,6 +2437,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             )[0]
         elif self.compress_ratio == 4:
             attn_output = attn_op(
+            # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
                 q,
                 ori_kv=swa_kv_cache,
                 cmp_kv=compress_kv_cache,
@@ -2451,6 +2460,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             )[0]
         else:
             attn_output = attn_op(
+            # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
                 q,
                 ori_kv=swa_kv_cache,
                 cmp_kv=compress_kv_cache,

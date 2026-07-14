@@ -38,6 +38,8 @@ vllm serve /home/weight/DeepSeek-V4-Flash \
   --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/home/yuanlinfeng/vllm_profiling", "torch_profiler_with_stack": false}' \
   --additional_config '{"enable_cpu_binding": "True", "multistream_overlap_shared_expert": true, "enable_qkv_pseudo_quant": true }' \
   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+  # --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
+  # --compilation-config '{"cudagraph_mode": "PIECEWISE"}'
   # --enforce-eager \
   # --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
        
