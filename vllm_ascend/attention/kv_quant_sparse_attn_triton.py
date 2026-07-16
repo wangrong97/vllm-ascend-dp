@@ -47,6 +47,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+from vllm.logger import logger
 
 # Packed-KV layout constants (kernel-fixed, see reference docstring).
 NOPE_DIM = 448
@@ -106,6 +107,7 @@ def _tile_score(
     stride_nope, stride_rope, stride_scale, stride_bt,
     BLOCK_N: tl.constexpr, NOPE_DIM: tl.constexpr, ROPE_DIM: tl.constexpr,
     SCALE_DIM: tl.constexpr, TILE_SIZE: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    IS_CMP_HIF8: tl.constexpr,
 ):
     """Load one contiguous KV tile, dequant, and compute Q@K^T*scale.
 
@@ -141,6 +143,10 @@ def _tile_score(
         (BLOCK_N, NOPE_DIM),
     )
     nope_dequant = nope * scale_per_dim
+    if IS_CMP_HIF8:
+        # compressor KV: hif8 pseudo-quantize the dequanted value (scale=1, fixed).
+        nope_dequant = _hif8_quant(nope_dequant, 1.0)
+        rope = _hif8_quant(rope, 1.0)
     nope_score = tl.sum(q_nope[None, :] * nope_dequant, axis=1)
     rope_score = tl.sum(q_rope[None, :] * rope, axis=1)
     score = (nope_score + rope_score) * softmax_scale_val
@@ -156,6 +162,7 @@ def _cmp4_token_score(
     stride_nope, stride_rope, stride_scale, stride_bt,
     NOPE_DIM: tl.constexpr, ROPE_DIM: tl.constexpr, SCALE_DIM: tl.constexpr,
     TILE_SIZE: tl.constexpr, TOPK: tl.constexpr, CMP_BLOCK_SIZE: tl.constexpr,
+    ENABLE_HIF8: tl.constexpr,
 ):
     """Load one cmp_ratio=4 top-k token (scalar), dequant, compute its score.
 
@@ -182,6 +189,10 @@ def _cmp4_token_score(
         (NOPE_DIM,),
     )
     nope_dequant = nope * scale_per_dim
+    if ENABLE_HIF8:
+        # compressor KV (cmp4): hif8 pseudo-quantize the dequanted value (scale=1, fixed).
+        nope_dequant = _hif8_quant(nope_dequant, 1.0)
+        rope = _hif8_quant(rope, 1.0)
     nope_score = tl.sum(q_nope * nope_dequant, axis=0)
     rope_score = tl.sum(q_rope * rope, axis=0)
     score = (nope_score + rope_score) * softmax_scale_val
@@ -202,6 +213,8 @@ def _dsa_decode_kernel(
     CmpBT_ptr,  # [num_seqs, max_cmp_blocks] int32
     CmpIdx_ptr,  # [num_q_tokens, TOPK] int32 (cmp_ratio=4 only)
     SequsedKV_ptr,  # [num_seqs] int32
+    QSeq_ptr,  # [num_q_tokens] int32 (prefill: q_tok->seq map; decode: unused)
+    CuSeqQ_ptr,  # [num_seqs+1] int32 (prefill: cu_seqlens_q; decode: unused)
     Sinks_ptr,  # [H] float32
     Out_ptr,  # [num_q_tokens, H, 512] bf16
     stride_q_t,
@@ -233,16 +246,27 @@ def _dsa_decode_kernel(
     BLOCK_N: tl.constexpr,
     HIF8_SCALE: tl.constexpr,
     ENABLE_HIF8: tl.constexpr,
+    IS_PREFILL: tl.constexpr,
 ):
     q_tok = tl.program_id(0)
     head = tl.program_id(1)
-    seq = q_tok // TOKENS_PER_SEQ
-    q_pos = q_tok % TOKENS_PER_SEQ
+    if IS_PREFILL:
+        # Variable-length prefill: map q_tok -> seq via a precomputed index, and
+        # read this seq's own query-token count T_b from cu_seqlens_q.
+        seq = tl.load(QSeq_ptr + q_tok)
+        q_start = tl.load(CuSeqQ_ptr + seq)
+        t_b = tl.load(CuSeqQ_ptr + seq + 1) - q_start
+        q_pos = q_tok - q_start
+    else:
+        # Decode (incl. MTP): uniform tokens_per_seq query tokens per request.
+        seq = q_tok // TOKENS_PER_SEQ
+        q_pos = q_tok % TOKENS_PER_SEQ
+        t_b = TOKENS_PER_SEQ
 
     kv_len = tl.load(SequsedKV_ptr + seq)
     # Query<->KV alignment: query token i is anchored at KV pos q_pos + next_tokens,
-    # next_tokens = kv_len - tokens_per_seq.
-    q_kv_pos = q_pos + (kv_len - TOKENS_PER_SEQ)
+    # next_tokens = kv_len - T_b (T_b == tokens_per_seq for decode).
+    q_kv_pos = q_pos + (kv_len - t_b)
 
     offs_nope = tl.arange(0, NOPE_DIM)
     offs_rope = tl.arange(0, ROPE_DIM)
@@ -276,6 +300,7 @@ def _dsa_decode_kernel(
                 seq, t, swa_start, swa_start, ori_valid_hi, softmax_scale_val,
                 stride_ori_nope, stride_ori_rope, stride_ori_scale, stride_ori_bt,
                 BLOCK_N, NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, BLOCK_SIZE,
+                IS_CMP_HIF8=False,
             )
             m_final = tl.maximum(m_final, tl.max(score, axis=0))
         if CMP_RATIO == 4:
@@ -285,6 +310,7 @@ def _dsa_decode_kernel(
                     seq, q_tok, k, cmp4_valid_hi, softmax_scale_val,
                     stride_cmp_nope, stride_cmp_rope, stride_cmp_scale, stride_cmp_bt,
                     NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, TOPK, CMP_BLOCK_SIZE,
+                    ENABLE_HIF8=ENABLE_HIF8,
                 )
                 m_final = tl.maximum(m_final, score)
         elif CMP_RATIO == 128:
@@ -296,12 +322,14 @@ def _dsa_decode_kernel(
                     seq, t, 0, 0, c128_hi, softmax_scale_val,
                     stride_cmp_nope, stride_cmp_rope, stride_cmp_scale, stride_cmp_bt,
                     BLOCK_N, NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, CMP_BLOCK_SIZE,
+                    IS_CMP_HIF8=ENABLE_HIF8,
                 )
                 m_final = tl.maximum(m_final, tl.max(score, axis=0))
-        # ---- Pass 2: weighted sum with hif8 on exp(score - m_final). ----
-        # l_i is seeded with the sink term exp(sink - m_final) (NOT hif8'd, same
-        # as the reference). No alpha rescale is needed: every tile shares the
-        # fixed m_final, so exp(score - m_final) is already on the global scale.
+        # ---- Pass 2: weighted sum. Only compressor exp is hif8-quantized; ----
+        # the SWA band keeps full precision (hif8 applied to cmp exp only).
+        # l_i is seeded with the sink term exp(sink - m_final) (NOT hif8'd). No
+        # alpha rescale is needed: every tile shares the fixed m_final, so
+        # exp(score - m_final) is already on the global scale.
         l_i = tl.exp(sink - m_final)
         acc_nope = tl.zeros([NOPE_DIM], dtype=tl.float32)
         acc_rope = tl.zeros([ROPE_DIM], dtype=tl.float32)
@@ -311,8 +339,11 @@ def _dsa_decode_kernel(
                 seq, t, swa_start, swa_start, ori_valid_hi, softmax_scale_val,
                 stride_ori_nope, stride_ori_rope, stride_ori_scale, stride_ori_bt,
                 BLOCK_N, NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, BLOCK_SIZE,
+                IS_CMP_HIF8=False,
             )
-            p = _hif8_quant(tl.exp(score - m_final), HIF8_SCALE)
+            # SWA band: keep full precision (no hif8); only compressor is quantized.
+            # p = _hif8_quant(tl.exp(score - m_final), HIF8_SCALE)
+            p = tl.exp(score - m_final)
             p = tl.where(valid, p, 0.0)
             l_i = l_i + tl.sum(p, axis=0)
             acc_nope = acc_nope + tl.sum(p[:, None] * nope_dequant, axis=0)
@@ -324,6 +355,7 @@ def _dsa_decode_kernel(
                     seq, q_tok, k, cmp4_valid_hi, softmax_scale_val,
                     stride_cmp_nope, stride_cmp_rope, stride_cmp_scale, stride_cmp_bt,
                     NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, TOPK, CMP_BLOCK_SIZE,
+                    ENABLE_HIF8=ENABLE_HIF8,
                 )
                 p = _hif8_quant(tl.exp(score - m_final), HIF8_SCALE)
                 p = tl.where(valid, p, 0.0)
@@ -339,6 +371,7 @@ def _dsa_decode_kernel(
                     seq, t, 0, 0, c128_hi, softmax_scale_val,
                     stride_cmp_nope, stride_cmp_rope, stride_cmp_scale, stride_cmp_bt,
                     BLOCK_N, NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, CMP_BLOCK_SIZE,
+                    IS_CMP_HIF8=ENABLE_HIF8,
                 )
                 p = _hif8_quant(tl.exp(score - m_final), HIF8_SCALE)
                 p = tl.where(valid, p, 0.0)
@@ -358,6 +391,7 @@ def _dsa_decode_kernel(
                 seq, t, swa_start, swa_start, ori_valid_hi, softmax_scale_val,
                 stride_ori_nope, stride_ori_rope, stride_ori_scale, stride_ori_bt,
                 BLOCK_N, NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, BLOCK_SIZE,
+                IS_CMP_HIF8=False,
             )
             m_block = tl.max(score, axis=0)
             m_new = tl.maximum(m_i, m_block)
@@ -375,6 +409,7 @@ def _dsa_decode_kernel(
                     seq, q_tok, k, cmp4_valid_hi, softmax_scale_val,
                     stride_cmp_nope, stride_cmp_rope, stride_cmp_scale, stride_cmp_bt,
                     NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, TOPK, CMP_BLOCK_SIZE,
+                    ENABLE_HIF8=ENABLE_HIF8,
                 )
                 m_new = tl.maximum(m_i, score)
                 alpha = tl.exp(m_i - m_new)
@@ -393,6 +428,7 @@ def _dsa_decode_kernel(
                     seq, t, 0, 0, c128_hi, softmax_scale_val,
                     stride_cmp_nope, stride_cmp_rope, stride_cmp_scale, stride_cmp_bt,
                     BLOCK_N, NOPE_DIM, ROPE_DIM, SCALE_DIM, TILE_SIZE, CMP_BLOCK_SIZE,
+                    IS_CMP_HIF8=ENABLE_HIF8,
                 )
                 m_block = tl.max(score, axis=0)
                 m_new = tl.maximum(m_i, m_block)
@@ -489,6 +525,14 @@ def kv_quant_sparse_attn_triton_decode(
     Returns:
         ``[num_q_tokens, H, 512]`` bf16 attention output.
     """
+    _enable_hif8 = os.environ.get("VLLM_ASCEND_DSA_TRITON_P_HIF8", "1") != "0"
+    logger.info_once(
+        "[triton-dsa-decode] dispatch: cmp_ratio=%s ENABLE_HIF8=%s HIF8_SCALE=%s | cmp_kv value hif8(scale=1)=%s",
+        cmp_ratio,
+        _enable_hif8,
+        float(os.environ.get("VLLM_ASCEND_DSA_TRITON_HIF8_SCALE", "8.0")),
+        (cmp_ratio in (4, 128)) and _enable_hif8,
+    )
     num_q_tokens, num_heads, head_dim = q.shape
     assert head_dim == HEAD_DIM, f"head_dim must be {HEAD_DIM}, got {head_dim}"
     num_seqs = seqused_kv.shape[0]
@@ -539,6 +583,8 @@ def kv_quant_sparse_attn_triton_decode(
         cmp_bt,
         cmp_sparse_indices,
         seqused_kv,
+        seqused_kv,  # QSeq_ptr (unused: IS_PREFILL=False branch)
+        seqused_kv,  # CuSeqQ_ptr (unused: IS_PREFILL=False branch)
         sinks,
         out,
         q.stride(0),
@@ -579,5 +625,153 @@ def kv_quant_sparse_attn_triton_decode(
         # production A8C4 behavior). Used to isolate attention-logic errors from
         # HiF8-application errors when bisecting against the ascend-c op.
         ENABLE_HIF8=os.environ.get("VLLM_ASCEND_DSA_TRITON_P_HIF8", "1") != "0",
+        IS_PREFILL=False,
+    )
+    return out
+
+
+def kv_quant_sparse_attn_triton_prefill(
+    q: torch.Tensor,
+    ori_kv: torch.Tensor,
+    ori_block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_kv: torch.Tensor,
+    sinks: torch.Tensor,
+    softmax_scale: float,
+    cmp_ratio: int = 1,
+    cmp_kv: torch.Tensor | None = None,
+    cmp_block_table: torch.Tensor | None = None,
+    cmp_sparse_indices: torch.Tensor | None = None,
+    ori_block_size: int = 128,
+    cmp_block_size: int = 128,
+    ori_window_size: int = 128,
+    max_cmp_tokens: int = 0,
+    block_n: int = 16,
+) -> torch.Tensor:
+    """Graph-capturable Triton PREFILL attention (variable-length, TND layout).
+
+    Mirrors ``kv_quant_sparse_attn_triton_decode`` for the prefill path. ``q`` is
+    ``[num_prefill_tokens, H, 512]`` — all prefill query tokens concatenated
+    across the batch, with ``cu_seqlens_q`` (``[num_seqs+1]``) giving each seq's
+    token range. Each query token attends to its own causal SWA window +
+    compressed KV, with the same two-pass global HiF8 on exp scores as decode.
+
+    Args:
+        q: ``[num_q_tokens, H, 512]`` bf16 (batch-concatenated prefill tokens).
+        ori_kv: SWA KV pool ``[num_blocks, block_size, 1, 640]`` (1-byte dtype).
+        ori_block_table: ``[num_seqs, max_ori_blocks]`` int32.
+        cu_seqlens_q: ``[num_seqs+1]`` int32, cumulative query token counts.
+        seqused_kv: ``[num_seqs]`` int32, per-seq valid ori_kv length.
+        sinks: ``[H]`` float32 learnable sink logits.
+        softmax_scale: attention scale applied to ``Q @ K^T``.
+        cmp_ratio: 1 (SWA only) / 4 (sparse) / 128 (dense compressed).
+        cmp_kv, cmp_block_table, cmp_sparse_indices: compressed KV (for 4/128).
+        max_cmp_tokens: static upper bound on ``kv_len // cmp_ratio`` (ratio=128).
+        block_n: KV tile size loaded per inner iteration.
+
+    Returns:
+        ``[num_q_tokens, H, 512]`` bf16 attention output.
+    """
+    _enable_hif8 = os.environ.get("VLLM_ASCEND_DSA_TRITON_P_HIF8", "1") != "0"
+    logger.info_once(
+        "[triton-dsa-prefill] dispatch: cmp_ratio=%s ENABLE_HIF8=%s HIF8_SCALE=%s | cmp_kv value hif8(scale=1)=%s",
+        cmp_ratio,
+        _enable_hif8,
+        float(os.environ.get("VLLM_ASCEND_DSA_TRITON_HIF8_SCALE", "8.0")),
+        (cmp_ratio in (4, 128)) and _enable_hif8,
+    )
+    num_q_tokens, num_heads, head_dim = q.shape
+    assert head_dim == HEAD_DIM, f"head_dim must be {HEAD_DIM}, got {head_dim}"
+    num_seqs = seqused_kv.shape[0]
+    assert cu_seqlens_q.shape[0] == num_seqs + 1
+    assert q.dtype == torch.bfloat16
+    assert cmp_ratio in (1, 4, 128), f"cmp_ratio must be 1/4/128, got {cmp_ratio}"
+
+    # Map each q_tok -> seq id (variable-length prefill). q_tok in
+    # [cu_seqlens_q[seq], cu_seqlens_q[seq+1]) -> seq. searchsorted(right=True)
+    # returns count of cu_seqlens_q entries <= q_tok, so -1 gives the seq.
+    q_tok_ids = torch.arange(num_q_tokens, device=q.device)
+    q_seq = (torch.searchsorted(cu_seqlens_q, q_tok_ids, right=True) - 1).to(torch.int32)
+
+    ori_nope, ori_rope, ori_scale = _packed_kv_views(ori_kv)
+
+    if cmp_ratio == 1:
+        cmp_nope, cmp_rope, cmp_scale = ori_nope, ori_rope, ori_scale
+        cmp_bt = ori_block_table
+        cmp_sparse_indices = q.new_full((num_q_tokens, 1), -1, dtype=torch.int32)
+        topk = 1
+        max_cmp_tiles = 1
+    else:
+        assert cmp_kv is not None and cmp_block_table is not None
+        cmp_nope, cmp_rope, cmp_scale = _packed_kv_views(cmp_kv)
+        cmp_bt = cmp_block_table
+        if cmp_ratio == 4:
+            assert cmp_sparse_indices is not None
+            # IndexCache returns cmp indices as [T, 1, K]; collapse to 2D [T, K].
+            if cmp_sparse_indices.dim() > 2:
+                cmp_sparse_indices = cmp_sparse_indices.reshape(
+                    cmp_sparse_indices.shape[0], -1
+                )
+            topk = cmp_sparse_indices.shape[1]
+            max_cmp_tiles = 1
+        else:  # 128
+            cmp_sparse_indices = q.new_full((num_q_tokens, 1), -1, dtype=torch.int32)
+            topk = 1
+            mt = max(max_cmp_tokens, 1)
+            max_cmp_tiles = (mt + block_n - 1) // block_n
+
+    win_left = ori_window_size - 1
+    max_ori_tiles = (ori_window_size + block_n - 1) // block_n
+
+    out = torch.empty_like(q)
+    grid = (num_q_tokens, num_heads)
+
+    _dsa_decode_kernel[grid](
+        q,
+        ori_nope,
+        ori_rope,
+        ori_scale,
+        ori_block_table,
+        cmp_nope,
+        cmp_rope,
+        cmp_scale,
+        cmp_bt,
+        cmp_sparse_indices,
+        seqused_kv,
+        q_seq,  # QSeq_ptr: q_tok -> seq id
+        cu_seqlens_q,  # CuSeqQ_ptr: per-seq query token boundaries
+        sinks,
+        out,
+        q.stride(0),
+        q.stride(1),
+        ori_nope.stride(1),  # token-in-block stride (640 fp8 elements)
+        ori_rope.stride(1),  # 320 bf16 elements
+        ori_scale.stride(1),  # 640 u8 elements
+        cmp_nope.stride(1),
+        cmp_rope.stride(1),
+        cmp_scale.stride(1),
+        ori_block_table.stride(0),
+        cmp_bt.stride(0),
+        out.stride(0),
+        out.stride(1),
+        softmax_scale,
+        HEAD_DIM=HEAD_DIM,
+        NOPE_DIM=NOPE_DIM,
+        ROPE_DIM=ROPE_DIM,
+        SCALE_DIM=SCALE_DIM,
+        TILE_SIZE=64,
+        BLOCK_SIZE=ori_block_size,
+        CMP_BLOCK_SIZE=cmp_block_size,
+        TOPK=topk,
+        CMP_RATIO=cmp_ratio,
+        ORI_WIN_LEFT=win_left,
+        # Unused for prefill: IS_PREFILL=True reads T_b from cu_seqlens_q.
+        TOKENS_PER_SEQ=1,
+        MAX_ORI_TILES=max_ori_tiles,
+        MAX_CMP_TILES=max_cmp_tiles,
+        BLOCK_N=block_n,
+        HIF8_SCALE=float(os.environ.get("VLLM_ASCEND_DSA_TRITON_HIF8_SCALE", "8.0")),
+        ENABLE_HIF8=os.environ.get("VLLM_ASCEND_DSA_TRITON_P_HIF8", "1") != "0",
+        IS_PREFILL=True,
     )
     return out

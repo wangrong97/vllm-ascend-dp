@@ -140,6 +140,61 @@ def _dsa_triton_decode(
     )
 
 
+def _dsa_triton_prefill(
+    q,
+    ori_kv,
+    ori_block_table,
+    cu_seqlens_q,
+    seqused_kv,
+    sinks,
+    softmax_scale,
+    compress_ratio,
+    cmp_kv=None,
+    cmp_block_table=None,
+    cmp_sparse_indices=None,
+    ori_block_size: int = 128,
+    cmp_block_size: int = 128,
+    ori_window_size: int = 128,
+    max_model_len: int = 0,
+    **kwargs,
+):
+    """Route DSA PREFILL attention through the from-scratch Triton kernel
+    (vllm_ascend.attention.kv_quant_sparse_attn_triton), prefill variant.
+
+    Enabled via additional_config.enable_dsa_triton_prefill=true. Drop-in for
+    the kv_quant_sparse_attn_sharedkv_pytorch reference call site in
+    _forward_prefill. Handles variable-length prefill (cu_seqlens_q) and all
+    compress_ratios, with two-pass global HiF8 on exp scores.
+    """
+    from vllm_ascend.attention.kv_quant_sparse_attn_triton import (
+        kv_quant_sparse_attn_triton_prefill,
+    )
+
+    if cmp_sparse_indices is not None:
+        logger.info_once(
+            "[DSA-TRITON-PREFILL] cmp_sparse_indices orig shape=%s dtype=%s",
+            tuple(cmp_sparse_indices.shape), cmp_sparse_indices.dtype,
+        )
+    max_cmp_tokens = max(max_model_len // 128, 1) if compress_ratio == 128 else 0
+    return kv_quant_sparse_attn_triton_prefill(
+        q=q,
+        ori_kv=ori_kv,
+        ori_block_table=ori_block_table,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_kv=seqused_kv,
+        sinks=sinks,
+        softmax_scale=softmax_scale,
+        cmp_ratio=compress_ratio,
+        cmp_kv=cmp_kv,
+        cmp_block_table=cmp_block_table,
+        cmp_sparse_indices=cmp_sparse_indices,
+        ori_block_size=ori_block_size,
+        cmp_block_size=cmp_block_size,
+        ori_window_size=ori_window_size,
+        max_cmp_tokens=max_cmp_tokens,
+    )
+
+
 def dsv4_dsa_overlap_stream() -> torch.npu.Stream:
     global _DSV4_DSA_OVERLAP_STREAM
     if _DSV4_DSA_OVERLAP_STREAM is None:
@@ -1512,6 +1567,9 @@ class AscendDSAImpl(DSAAttentionImpl):
         self.enable_dsa_triton_decode = bool(
             getattr(ascend_config, "enable_dsa_triton_decode", False)
         )
+        self.enable_dsa_triton_prefill = bool(
+            getattr(ascend_config, "enable_dsa_triton_prefill", False)
+        )
         self.vllm_config = get_current_vllm_config()
 
         # indexer param
@@ -2040,7 +2098,7 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         # Experimental: pseudo-quantize Q before sparse attention. The output
         # remains bf16 so the existing attention kernel needs no change.
-        if self.enable_qkv_pseudo_quant:
+        if self.enable_qkv_pseudo_quant and self.compress_ratio == 4:
             q = pseudo_quantize_hif8_per_tensor_fixed_scale(q, scale=8.0)
 
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
@@ -2150,7 +2208,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             if compressed_kv.shape[0] > 0:
                 # Experimental: pseudo-quantize compressed KV before writing it
                 # to the cache so later reads observe the quantized values.
-                if self.enable_qkv_pseudo_quant:
+                if self.enable_qkv_pseudo_quant and self.compress_ratio == 4:
                     # logger.info_once(f"prefill compressed_kv.dtype:{compressed_kv.dtype}, compressed_kv.shape:{compressed_kv.shape}")
                     compressed_kv = pseudo_quantize_fp4_per_block(
                         compressed_kv, block_size=self.kv_pseudo_quant_block_size
@@ -2198,33 +2256,72 @@ class AscendDSAImpl(DSAAttentionImpl):
                     extra_attn_kwargs, cu_seqlens_cmp_kv=common_prefill_metadata.cu_c4_cmp_seqlen_list
                 )
                 
-                # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
-                attn_output = attn_op(
-                    q,
-                    ori_kv=swa_kv_cache,
-                    cmp_kv=compress_kv_cache,
-                    cmp_sparse_indices=compress_topk_idxs,
-                    ori_block_table=swa_prefill_metadata.block_table,
-                    cmp_block_table=compressor_prefill_metadata.block_table,
-                    cu_seqlens_q=actual_seq_lengths_query,
-                    seqused_kv=actual_seq_lengths_key,
-                    sinks=self.attn_sink,
-                    metadata=common_prefill_metadata.sas_metadata,
-                    softmax_scale=self.softmax_scale,
-                    cmp_ratio=self.compress_ratio,
-                    ori_mask_mode=4,
-                    cmp_mask_mode=3,
-                    ori_win_left=self.window_size - 1,
-                    ori_win_right=0,
-                    layout_q="TND",
-                    layout_kv="PA_ND",
-                    **extra_attn_kwargs,
-                )[0]
+                if self.enable_dsa_triton_prefill:
+                    logger.info_once("enable_dsa_triton_prefill, compress_ratio = 4")
+                    return _dsa_triton_prefill(
+                        q=q,
+                        ori_kv=swa_kv_cache,
+                        cmp_kv=compress_kv_cache,
+                        cmp_sparse_indices=compress_topk_idxs,
+                        ori_block_table=swa_prefill_metadata.block_table,
+                        cmp_block_table=compressor_prefill_metadata.block_table,
+                        cu_seqlens_q=actual_seq_lengths_query,
+                        seqused_kv=actual_seq_lengths_key,
+                        sinks=self.attn_sink,
+                        softmax_scale=self.softmax_scale,
+                        compress_ratio=self.compress_ratio,
+                        ori_block_size=swa_prefill_metadata.block_size,
+                        cmp_block_size=compressor_prefill_metadata.block_size,
+                        ori_window_size=self.window_size,
+                        max_model_len=self.vllm_config.model_config.max_model_len,
+                    )
+                else:
+                    # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
+                    attn_output = attn_op(
+                        q,
+                        ori_kv=swa_kv_cache,
+                        cmp_kv=compress_kv_cache,
+                        cmp_sparse_indices=compress_topk_idxs,
+                        ori_block_table=swa_prefill_metadata.block_table,
+                        cmp_block_table=compressor_prefill_metadata.block_table,
+                        cu_seqlens_q=actual_seq_lengths_query,
+                        seqused_kv=actual_seq_lengths_key,
+                        sinks=self.attn_sink,
+                        metadata=common_prefill_metadata.sas_metadata,
+                        softmax_scale=self.softmax_scale,
+                        cmp_ratio=self.compress_ratio,
+                        ori_mask_mode=4,
+                        cmp_mask_mode=3,
+                        ori_win_left=self.window_size - 1,
+                        ori_win_right=0,
+                        layout_q="TND",
+                        layout_kv="PA_ND",
+                        **extra_attn_kwargs,
+                    )[0]
             else:
                 DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
                     extra_attn_kwargs, cu_seqlens_cmp_kv=common_prefill_metadata.cu_c128_cmp_seqlen_list
                 )
-                # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
+                # if self.enable_dsa_triton_prefill:
+                #     logger.info_once("enable_dsa_triton_prefill, compress_ratio = 128")
+                #     return _dsa_triton_prefill(
+                #         q=q,
+                #         ori_kv=swa_kv_cache,
+                #         cmp_kv=compress_kv_cache,
+                #         ori_block_table=swa_prefill_metadata.block_table,
+                #         cmp_block_table=compressor_prefill_metadata.block_table,
+                #         cu_seqlens_q=actual_seq_lengths_query,
+                #         seqused_kv=actual_seq_lengths_key,
+                #         sinks=self.attn_sink,
+                #         softmax_scale=self.softmax_scale,
+                #         compress_ratio=self.compress_ratio,
+                #         ori_block_size=swa_prefill_metadata.block_size,
+                #         cmp_block_size=compressor_prefill_metadata.block_size,
+                #         ori_window_size=self.window_size,
+                #         max_model_len=self.vllm_config.model_config.max_model_len,
+                #     )
+                # else:
+                    # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
                 attn_output = attn_op(
                     q,
                     ori_kv=swa_kv_cache,
@@ -2373,7 +2470,7 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         # Experimental: pseudo-quantize Q before sparse attention. The output
         # remains bf16 so the existing attention kernel needs no change.
-        if self.enable_qkv_pseudo_quant:
+        if self.enable_qkv_pseudo_quant and self.compress_ratio == 4:
             q = pseudo_quantize_hif8_per_tensor_fixed_scale(q, scale=8.0)
 
         if self.compress_ratio > 1:
@@ -2457,7 +2554,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             if compressed_kv.shape[0] > 0:
                 # Experimental: pseudo-quantize compressed KV before writing it
                 # to the cache so later reads observe the quantized values.
-                if self.enable_qkv_pseudo_quant:
+                if self.enable_qkv_pseudo_quant and self.compress_ratio == 4:
                     # logger.info_once(f"decode compressed_kv.dtype:{compressed_kv.dtype}, compressed_kv.shape:{compressed_kv.shape}")
                     compressed_kv = pseudo_quantize_fp4_per_block(
                         compressed_kv, block_size=self.kv_pseudo_quant_block_size
@@ -2651,46 +2748,46 @@ class AscendDSAImpl(DSAAttentionImpl):
                     ori_window_size=self.window_size,
                 )
             else:
-                if self.enable_dsa_triton_decode:
-                    logger.info_once(f"enable_dsa_triton_decode, compress_ratio = 128")
-                    attn_output = _dsa_triton_decode(
-                        q,
-                        ori_kv=swa_kv_cache,
-                        cmp_kv=compress_kv_cache,
-                        cmp_sparse_indices=None,
-                        ori_block_table=swa_decode_metadata.block_table,
-                        cmp_block_table=compressor_decode_metadata.block_table,
-                        seqused_kv=actual_seq_lengths_key,
-                        sinks=self.attn_sink,
-                        softmax_scale=self.softmax_scale,
-                        compress_ratio=self.compress_ratio,
-                        ori_block_size=swa_decode_metadata.block_size,
-                        cmp_block_size=compressor_decode_metadata.block_size,
-                        ori_window_size=self.window_size,
-                        max_model_len=self.vllm_config.model_config.max_model_len,
-                    )
-                else:
-                    attn_output = attn_op(
-                    # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
-                        q,
-                        ori_kv=swa_kv_cache,
-                        cmp_kv=compress_kv_cache,
-                        ori_block_table=swa_decode_metadata.block_table,
-                        cmp_block_table=compressor_decode_metadata.block_table,
-                        cu_seqlens_q=actual_seq_lengths_query,
-                        seqused_kv=actual_seq_lengths_key,
-                        sinks=self.attn_sink,
-                        metadata=compressor_decode_metadata.sas_metadata,
-                        softmax_scale=self.softmax_scale,
-                        cmp_ratio=self.compress_ratio,
-                        ori_mask_mode=4,
-                        cmp_mask_mode=3,
-                        ori_win_left=self.window_size - 1,
-                        ori_win_right=0,
-                        layout_q="TND",
-                        layout_kv="PA_ND",
-                        **extra_attn_kwargs,
-                    )[0]
+                # if self.enable_dsa_triton_decode:
+                #     logger.info_once(f"enable_dsa_triton_decode, compress_ratio = 128")
+                #     attn_output = _dsa_triton_decode(
+                #         q,
+                #         ori_kv=swa_kv_cache,
+                #         cmp_kv=compress_kv_cache,
+                #         cmp_sparse_indices=None,
+                #         ori_block_table=swa_decode_metadata.block_table,
+                #         cmp_block_table=compressor_decode_metadata.block_table,
+                #         seqused_kv=actual_seq_lengths_key,
+                #         sinks=self.attn_sink,
+                #         softmax_scale=self.softmax_scale,
+                #         compress_ratio=self.compress_ratio,
+                #         ori_block_size=swa_decode_metadata.block_size,
+                #         cmp_block_size=compressor_decode_metadata.block_size,
+                #         ori_window_size=self.window_size,
+                #         max_model_len=self.vllm_config.model_config.max_model_len,
+                #     )
+                # else:
+                attn_output = attn_op(
+                # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
+                    q,
+                    ori_kv=swa_kv_cache,
+                    cmp_kv=compress_kv_cache,
+                    ori_block_table=swa_decode_metadata.block_table,
+                    cmp_block_table=compressor_decode_metadata.block_table,
+                    cu_seqlens_q=actual_seq_lengths_query,
+                    seqused_kv=actual_seq_lengths_key,
+                    sinks=self.attn_sink,
+                    metadata=compressor_decode_metadata.sas_metadata,
+                    softmax_scale=self.softmax_scale,
+                    cmp_ratio=self.compress_ratio,
+                    ori_mask_mode=4,
+                    cmp_mask_mode=3,
+                    ori_win_left=self.window_size - 1,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_ND",
+                    **extra_attn_kwargs,
+                )[0]
         return attn_output
 
     def _indexer_qkv_prepare(

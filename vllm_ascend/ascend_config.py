@@ -171,6 +171,11 @@ class AscendConfig:
         self.enable_dsa_triton_decode = bool(
             additional_config.get("enable_dsa_triton_decode", False)
         )
+        # Route DSA prefill attention through the Triton kernel
+        # (kv_quant_sparse_attn_triton_prefill) instead of the ascend-c op.
+        self.enable_dsa_triton_prefill = bool(
+            additional_config.get("enable_dsa_triton_prefill", False)
+        )
 
         self.enable_matmul_allreduce = self._get_config_value(
             additional_config,
