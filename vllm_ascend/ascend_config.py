@@ -164,6 +164,8 @@ class AscendConfig:
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", True)
         # Experimental pseudo-quantization of q/kv before DSA attention.
         self.enable_qkv_pseudo_quant = bool(additional_config.get("enable_qkv_pseudo_quant", False))
+        # Pseudo-quantize q (hif8) + cmp_kv (fp4) on compress_ratio==128 layers.
+        self.enable_qkv_pseudo_quant_c128 = bool(additional_config.get("enable_qkv_pseudo_quant_c128", False))
         self.kv_pseudo_quant_block_size = int(additional_config.get("kv_pseudo_quant_block_size", 32))
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))
         # Route DSA decode attention through the Triton kernel
@@ -175,6 +177,14 @@ class AscendConfig:
         # (kv_quant_sparse_attn_triton_prefill) instead of the ascend-c op.
         self.enable_dsa_triton_prefill = bool(
             additional_config.get("enable_dsa_triton_prefill", False)
+        )
+        # Route DSA cmp_ratio==128 attention through Triton, separate from c4
+        # (c4 still uses enable_dsa_triton_decode / enable_dsa_triton_prefill).
+        self.enable_dsa_triton_decode_c128 = bool(
+            additional_config.get("enable_dsa_triton_decode_c128", False)
+        )
+        self.enable_dsa_triton_prefill_c128 = bool(
+            additional_config.get("enable_dsa_triton_prefill_c128", False)
         )
 
         self.enable_matmul_allreduce = self._get_config_value(

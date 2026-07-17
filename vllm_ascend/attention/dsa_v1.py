@@ -1559,6 +1559,9 @@ class AscendDSAImpl(DSAAttentionImpl):
         self.enable_qkv_pseudo_quant = bool(
             getattr(ascend_config, "enable_qkv_pseudo_quant", False)
         )
+        self.enable_qkv_pseudo_quant_c128 = bool(
+            getattr(ascend_config, "enable_qkv_pseudo_quant_c128", False)
+        )
         self.kv_pseudo_quant_block_size = int(
             getattr(ascend_config, "kv_pseudo_quant_block_size", 16)
         )
@@ -1569,6 +1572,12 @@ class AscendDSAImpl(DSAAttentionImpl):
         )
         self.enable_dsa_triton_prefill = bool(
             getattr(ascend_config, "enable_dsa_triton_prefill", False)
+        )
+        self.enable_dsa_triton_decode_c128 = bool(
+            getattr(ascend_config, "enable_dsa_triton_decode_c128", False)
+        )
+        self.enable_dsa_triton_prefill_c128 = bool(
+            getattr(ascend_config, "enable_dsa_triton_prefill_c128", False)
         )
         self.vllm_config = get_current_vllm_config()
 
@@ -2098,7 +2107,12 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         # Experimental: pseudo-quantize Q before sparse attention. The output
         # remains bf16 so the existing attention kernel needs no change.
-        if self.enable_qkv_pseudo_quant and self.compress_ratio == 4:
+        if (
+            self.compress_ratio == 4 and self.enable_qkv_pseudo_quant
+        ) or (
+            self.compress_ratio == 128 and self.enable_qkv_pseudo_quant_c128
+        ):
+            logger.info_once(f"[prefill][开始进行q hif8伪量化]compress_ratio :{self.compress_ratio}, enable_qkv_pseudo_quant:{self.enable_qkv_pseudo_quant}, enable_qkv_pseudo_quant_c128:{self.enable_qkv_pseudo_quant_c128}")
             q = pseudo_quantize_hif8_per_tensor_fixed_scale(q, scale=8.0)
 
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
@@ -2208,13 +2222,16 @@ class AscendDSAImpl(DSAAttentionImpl):
             if compressed_kv.shape[0] > 0:
                 # Experimental: pseudo-quantize compressed KV before writing it
                 # to the cache so later reads observe the quantized values.
-                if self.enable_qkv_pseudo_quant and self.compress_ratio == 4:
-                    # logger.info_once(f"prefill compressed_kv.dtype:{compressed_kv.dtype}, compressed_kv.shape:{compressed_kv.shape}")
+                if (
+                    self.compress_ratio == 4 and self.enable_qkv_pseudo_quant
+                ) or (
+                    self.compress_ratio == 128 and self.enable_qkv_pseudo_quant_c128
+                ):
+                    logger.info_once(f"[prefill][开始进行cmp_kv fp4伪量化]compress_ratio :{self.compress_ratio}, enable_qkv_pseudo_quant:{self.enable_qkv_pseudo_quant}, enable_qkv_pseudo_quant_c128:{self.enable_qkv_pseudo_quant_c128}")
                     compressed_kv = pseudo_quantize_fp4_per_block(
                         compressed_kv, block_size=self.kv_pseudo_quant_block_size
                     )
                 DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
-                # logger.info_once(f"prefill after cache compressed_kv.dtype:{compressed_kv.dtype}, compressed_kv.shape:{compressed_kv.shape}")
 
             if self.multistream_dsv4_dsa_overlap and self.compress_ratio == 4 and not self.skip_topk:
                 # Wait aux_stream weights_proj done, then compute dot
@@ -2302,46 +2319,46 @@ class AscendDSAImpl(DSAAttentionImpl):
                 DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
                     extra_attn_kwargs, cu_seqlens_cmp_kv=common_prefill_metadata.cu_c128_cmp_seqlen_list
                 )
-                # if self.enable_dsa_triton_prefill:
-                #     logger.info_once("enable_dsa_triton_prefill, compress_ratio = 128")
-                #     return _dsa_triton_prefill(
-                #         q=q,
-                #         ori_kv=swa_kv_cache,
-                #         cmp_kv=compress_kv_cache,
-                #         ori_block_table=swa_prefill_metadata.block_table,
-                #         cmp_block_table=compressor_prefill_metadata.block_table,
-                #         cu_seqlens_q=actual_seq_lengths_query,
-                #         seqused_kv=actual_seq_lengths_key,
-                #         sinks=self.attn_sink,
-                #         softmax_scale=self.softmax_scale,
-                #         compress_ratio=self.compress_ratio,
-                #         ori_block_size=swa_prefill_metadata.block_size,
-                #         cmp_block_size=compressor_prefill_metadata.block_size,
-                #         ori_window_size=self.window_size,
-                #         max_model_len=self.vllm_config.model_config.max_model_len,
-                #     )
-                # else:
+                if self.enable_dsa_triton_prefill_c128:
+                    logger.info_once("enable_dsa_triton_prefill_c128, compress_ratio = 128")
+                    return _dsa_triton_prefill(
+                        q=q,
+                        ori_kv=swa_kv_cache,
+                        cmp_kv=compress_kv_cache,
+                        ori_block_table=swa_prefill_metadata.block_table,
+                        cmp_block_table=compressor_prefill_metadata.block_table,
+                        cu_seqlens_q=actual_seq_lengths_query,
+                        seqused_kv=actual_seq_lengths_key,
+                        sinks=self.attn_sink,
+                        softmax_scale=self.softmax_scale,
+                        compress_ratio=self.compress_ratio,
+                        ori_block_size=swa_prefill_metadata.block_size,
+                        cmp_block_size=compressor_prefill_metadata.block_size,
+                        ori_window_size=self.window_size,
+                        max_model_len=self.vllm_config.model_config.max_model_len,
+                    )
+                else:
                     # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
-                attn_output = attn_op(
-                    q,
-                    ori_kv=swa_kv_cache,
-                    cmp_kv=compress_kv_cache,
-                    ori_block_table=swa_prefill_metadata.block_table,
-                    cmp_block_table=compressor_prefill_metadata.block_table,
-                    cu_seqlens_q=actual_seq_lengths_query,
-                    seqused_kv=actual_seq_lengths_key,
-                    sinks=self.attn_sink,
-                    metadata=common_prefill_metadata.sas_metadata,
-                    softmax_scale=self.softmax_scale,
-                    cmp_ratio=self.compress_ratio,
-                    ori_mask_mode=4,
-                    cmp_mask_mode=3,
-                    ori_win_left=self.window_size - 1,
-                    ori_win_right=0,
-                    layout_q="TND",
-                    layout_kv="PA_ND",
-                    **extra_attn_kwargs,
-                )[0]
+                    attn_output = attn_op(
+                        q,
+                        ori_kv=swa_kv_cache,
+                        cmp_kv=compress_kv_cache,
+                        ori_block_table=swa_prefill_metadata.block_table,
+                        cmp_block_table=compressor_prefill_metadata.block_table,
+                        cu_seqlens_q=actual_seq_lengths_query,
+                        seqused_kv=actual_seq_lengths_key,
+                        sinks=self.attn_sink,
+                        metadata=common_prefill_metadata.sas_metadata,
+                        softmax_scale=self.softmax_scale,
+                        cmp_ratio=self.compress_ratio,
+                        ori_mask_mode=4,
+                        cmp_mask_mode=3,
+                        ori_win_left=self.window_size - 1,
+                        ori_win_right=0,
+                        layout_q="TND",
+                        layout_kv="PA_ND",
+                        **extra_attn_kwargs,
+                    )[0]
         return attn_output
 
     def _forward_decode(
@@ -2470,7 +2487,12 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         # Experimental: pseudo-quantize Q before sparse attention. The output
         # remains bf16 so the existing attention kernel needs no change.
-        if self.enable_qkv_pseudo_quant and self.compress_ratio == 4:
+        if (
+            self.compress_ratio == 4 and self.enable_qkv_pseudo_quant
+        ) or (
+            self.compress_ratio == 128 and self.enable_qkv_pseudo_quant_c128
+        ):
+            logger.info_once(f"[decode][开始进行q hif8伪量化]compress_ratio :{self.compress_ratio}, enable_qkv_pseudo_quant:{self.enable_qkv_pseudo_quant}, enable_qkv_pseudo_quant_c128:{self.enable_qkv_pseudo_quant_c128}")
             q = pseudo_quantize_hif8_per_tensor_fixed_scale(q, scale=8.0)
 
         if self.compress_ratio > 1:
@@ -2554,13 +2576,16 @@ class AscendDSAImpl(DSAAttentionImpl):
             if compressed_kv.shape[0] > 0:
                 # Experimental: pseudo-quantize compressed KV before writing it
                 # to the cache so later reads observe the quantized values.
-                if self.enable_qkv_pseudo_quant and self.compress_ratio == 4:
-                    # logger.info_once(f"decode compressed_kv.dtype:{compressed_kv.dtype}, compressed_kv.shape:{compressed_kv.shape}")
+                if (
+                    self.compress_ratio == 4 and self.enable_qkv_pseudo_quant
+                ) or (
+                    self.compress_ratio == 128 and self.enable_qkv_pseudo_quant_c128
+                ):
+                    logger.info_once(f"[decode][开始进行cmp_kv fp4伪量化]compress_ratio :{self.compress_ratio}, enable_qkv_pseudo_quant:{self.enable_qkv_pseudo_quant}, enable_qkv_pseudo_quant_c128:{self.enable_qkv_pseudo_quant_c128}")
                     compressed_kv = pseudo_quantize_fp4_per_block(
                         compressed_kv, block_size=self.kv_pseudo_quant_block_size
                     )
                 DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
-                # logger.info_once(f"decode after cache compressed_kv.dtype:{compressed_kv.dtype}, compressed_kv.shape:{compressed_kv.shape}")
 
             if self.multistream_dsv4_dsa_overlap and self.compress_ratio == 4 and not self.skip_topk:
                 # Wait aux_stream weights_proj done
@@ -2615,12 +2640,20 @@ class AscendDSAImpl(DSAAttentionImpl):
         # DEBUG: log once per (compress_ratio, path) so we can confirm triton is
         # actually hit for each layer type, without flooding every decode step.
         global _DSA_TRITON_DECODE_LOGGED
-        _dsa_triton = use_triton_decode or self.enable_dsa_triton_decode
+        _dsa_triton = (
+            use_triton_decode
+            or self.enable_dsa_triton_decode
+            or self.enable_dsa_triton_decode_c128
+        )
         _log_key = (self.compress_ratio, "triton" if _dsa_triton else "ascend-c")
         if _log_key not in _DSA_TRITON_DECODE_LOGGED:
             if _dsa_triton:
                 _reason = "triton"
-            elif not (_use_triton_decode() or self.enable_dsa_triton_decode):
+            elif not (
+                _use_triton_decode()
+                or self.enable_dsa_triton_decode
+                or self.enable_dsa_triton_decode_c128
+            ):
                 _reason = "ascend-c (triton disabled)"
             else:
                 _reason = (
@@ -2634,23 +2667,6 @@ class AscendDSAImpl(DSAAttentionImpl):
             _DSA_TRITON_DECODE_LOGGED.add(_log_key)
 
         if self.compress_ratio <= 1:
-            # if use_triton_decode:
-            #     attn_output = _triton_decode_c4(
-            #         q=q,
-            #         swa_kv_cache=swa_kv_cache,
-            #         compress_kv_cache=None,
-            #         cmp_sparse_indices=None,
-            #         ori_block_table=swa_decode_metadata.block_table,
-            #         cmp_block_table=None,
-            #         seqused_kv=actual_seq_lengths_key,
-            #         sinks=self.attn_sink,
-            #         softmax_scale=self.softmax_scale,
-            #         compress_ratio=self.compress_ratio,
-            #         ori_block_size=swa_decode_metadata.block_size,
-            #         cmp_block_size=None,
-            #         ori_window_size=self.window_size,
-            #     )
-            # else:
             attn_output = attn_op(
                 q,
                 ori_kv=swa_kv_cache,
@@ -2748,46 +2764,46 @@ class AscendDSAImpl(DSAAttentionImpl):
                     ori_window_size=self.window_size,
                 )
             else:
-                # if self.enable_dsa_triton_decode:
-                #     logger.info_once(f"enable_dsa_triton_decode, compress_ratio = 128")
-                #     attn_output = _dsa_triton_decode(
-                #         q,
-                #         ori_kv=swa_kv_cache,
-                #         cmp_kv=compress_kv_cache,
-                #         cmp_sparse_indices=None,
-                #         ori_block_table=swa_decode_metadata.block_table,
-                #         cmp_block_table=compressor_decode_metadata.block_table,
-                #         seqused_kv=actual_seq_lengths_key,
-                #         sinks=self.attn_sink,
-                #         softmax_scale=self.softmax_scale,
-                #         compress_ratio=self.compress_ratio,
-                #         ori_block_size=swa_decode_metadata.block_size,
-                #         cmp_block_size=compressor_decode_metadata.block_size,
-                #         ori_window_size=self.window_size,
-                #         max_model_len=self.vllm_config.model_config.max_model_len,
-                #     )
-                # else:
-                attn_output = attn_op(
-                # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
-                    q,
-                    ori_kv=swa_kv_cache,
-                    cmp_kv=compress_kv_cache,
-                    ori_block_table=swa_decode_metadata.block_table,
-                    cmp_block_table=compressor_decode_metadata.block_table,
-                    cu_seqlens_q=actual_seq_lengths_query,
-                    seqused_kv=actual_seq_lengths_key,
-                    sinks=self.attn_sink,
-                    metadata=compressor_decode_metadata.sas_metadata,
-                    softmax_scale=self.softmax_scale,
-                    cmp_ratio=self.compress_ratio,
-                    ori_mask_mode=4,
-                    cmp_mask_mode=3,
-                    ori_win_left=self.window_size - 1,
-                    ori_win_right=0,
-                    layout_q="TND",
-                    layout_kv="PA_ND",
-                    **extra_attn_kwargs,
-                )[0]
+                if self.enable_dsa_triton_decode_c128:
+                    logger.info_once(f"enable_dsa_triton_decode_c128, compress_ratio = 128")
+                    attn_output = _dsa_triton_decode(
+                        q,
+                        ori_kv=swa_kv_cache,
+                        cmp_kv=compress_kv_cache,
+                        cmp_sparse_indices=None,
+                        ori_block_table=swa_decode_metadata.block_table,
+                        cmp_block_table=compressor_decode_metadata.block_table,
+                        seqused_kv=actual_seq_lengths_key,
+                        sinks=self.attn_sink,
+                        softmax_scale=self.softmax_scale,
+                        compress_ratio=self.compress_ratio,
+                        ori_block_size=swa_decode_metadata.block_size,
+                        cmp_block_size=compressor_decode_metadata.block_size,
+                        ori_window_size=self.window_size,
+                        max_model_len=self.vllm_config.model_config.max_model_len,
+                    )
+                else:
+                    attn_output = attn_op(
+                    # attn_output = kv_quant_sparse_attn_sharedkv_pytorch(
+                        q,
+                        ori_kv=swa_kv_cache,
+                        cmp_kv=compress_kv_cache,
+                        ori_block_table=swa_decode_metadata.block_table,
+                        cmp_block_table=compressor_decode_metadata.block_table,
+                        cu_seqlens_q=actual_seq_lengths_query,
+                        seqused_kv=actual_seq_lengths_key,
+                        sinks=self.attn_sink,
+                        metadata=compressor_decode_metadata.sas_metadata,
+                        softmax_scale=self.softmax_scale,
+                        cmp_ratio=self.compress_ratio,
+                        ori_mask_mode=4,
+                        cmp_mask_mode=3,
+                        ori_win_left=self.window_size - 1,
+                        ori_win_right=0,
+                        layout_q="TND",
+                        layout_kv="PA_ND",
+                        **extra_attn_kwargs,
+                    )[0]
         return attn_output
 
     def _indexer_qkv_prepare(

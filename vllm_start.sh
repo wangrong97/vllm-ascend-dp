@@ -20,7 +20,7 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 # between captured segments. Decode + prefill are both covered (prefill
 # already runs eager, so this mainly affects the FULL decode graph).
 # export VLLM_ASCEND_ATTN_EAGER_BREAK=1
-export VLLM_ASCEND_DSA_TRITON_P_HIF8=0
+# export VLLM_ASCEND_DSA_TRITON_P_HIF8=0
 
 # vllm serve /mnt/share/weight/dsk_v4-flash-w8a8_mxfp-smooth-0707-full
 vllm serve /mnt/share/weight/DeepSeek-V4-Flash \
