@@ -110,15 +110,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Enable the experimental DeepSeek-V4 DSA Triton decode path. This is
-    # disabled by default. Valid values are 0 (disabled) and 1 (enabled);
-    # this is not sensitive.
+    # Enable the experimental in-tree DeepSeek-V4 DSA Triton decode path.
+    # Valid values are 0 (disabled) and 1 (enabled); this is not sensitive.
     "VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE", "0"))
     ),
-    # Directory containing decode_c4_triton.py for the experimental DSA
-    # Triton decode path. The default is unset; this is not sensitive.
-    "VLLM_ASCEND_DSA_TRITON_KERNEL_PATH": lambda: os.getenv("VLLM_ASCEND_DSA_TRITON_KERNEL_PATH", None),
     # Keep attention out of the ACL graph. When enabled ("1"), the FULL decode
     # graph is captured in segments split at every attention forward; each
     # attention runs eagerly between captured segments (GEMM/RMSNorm/MoE stay
