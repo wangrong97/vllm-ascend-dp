@@ -60,16 +60,26 @@ BUILD_METADATA_STEP_DECODE = 1
 
 _DSV4_DSA_OVERLAP_STREAM = None
 
-# DEBUG: one-shot log so the triton-vs-ascend-c dispatch decision is recorded
-# once per (compress_ratio, path) per process (avoids flooding every decode step).
-_DSA_TRITON_DECODE_LOGGED: set = set()
-
-
 def _use_triton_decode() -> bool:
     """Return whether the experimental Triton decode path is enabled."""
     from vllm_ascend import envs
 
-    return envs.VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE
+    if not envs.VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE:
+        return False
+    if not HAS_TRITON:
+        logger.warning_once(
+            "VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE is enabled, but Triton "
+            "is unavailable. Falling back to the native DSA operator."
+        )
+        return False
+    if get_ascend_device_type() not in {AscendDeviceType.A5}:
+        logger.warning_once(
+            "VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE currently supports only "
+            "Ascend A5 packed FP8 KV caches. Falling back to the native DSA "
+            "operator on this device."
+        )
+        return False
+    return True
 
 
 def _triton_decode_c4(**kwargs):
@@ -1581,6 +1591,14 @@ class AscendDSAImpl(DSAAttentionImpl):
         )
         self.vllm_config = get_current_vllm_config()
 
+        # Max query tokens per decode request (1 for plain decode, 1 + num_spec
+        # for MTP). Mirrors AscendDSAMetadataBuilder.decode_threshold; used as the
+        # static upper bound for the graph-safe triton decode KV pool sizing.
+        self.decode_threshold = 1
+        spec_config = self.vllm_config.speculative_config
+        if spec_config is not None:
+            self.decode_threshold += spec_config.num_speculative_tokens
+
         # indexer param
         if self.indexer is not None:
             self.indexer_heads: int = self.indexer.n_heads
@@ -2624,66 +2642,48 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
-        # q is (num_decode_tokens, ...) while actual_seq_lengths_key is per-request
-        # (num_decodes,). num_decode_tokens == num_decodes * decode_token_per_req:
-        # plain decode has 1 query token per request, MTP spec decode has more.
-        # The triton kernel handles both via grid (num_q_tokens, num_heads) and
-        # token->request mapping (q_tok_idx // tokens_per_seq).
-        num_decode_tokens = q.shape[0]
+        # query_start_loc provides the exact ragged token-to-request mapping for
+        # plain decode, mixed multi-request batches, and MTP speculative decode.
         num_decodes = actual_seq_lengths_key.numel()
-        use_triton_decode = (
-            _use_triton_decode()
-            and num_decodes > 0
-            and num_decode_tokens % num_decodes == 0
-        )
-
-        # DEBUG: log once per (compress_ratio, path) so we can confirm triton is
-        # actually hit for each layer type, without flooding every decode step.
-        global _DSA_TRITON_DECODE_LOGGED
-        _dsa_triton = (
-            use_triton_decode
-            or self.enable_dsa_triton_decode
-            or self.enable_dsa_triton_decode_c128
-        )
-        _log_key = (self.compress_ratio, "triton" if _dsa_triton else "ascend-c")
-        if _log_key not in _DSA_TRITON_DECODE_LOGGED:
-            if _dsa_triton:
-                _reason = "triton"
-            elif not (
-                _use_triton_decode()
-                or self.enable_dsa_triton_decode
-                or self.enable_dsa_triton_decode_c128
-            ):
-                _reason = "ascend-c (triton disabled)"
-            else:
-                _reason = (
-                    f"ascend-c (triton skipped: num_decode_tokens="
-                    f"{num_decode_tokens} not a multiple of num_decodes={num_decodes})"
-                )
-            logger.info(
-                "[DSA-TRITON] layer=%s compress_ratio=%s -> %s decode path",
-                layer_name, self.compress_ratio, _reason,
-            )
-            _DSA_TRITON_DECODE_LOGGED.add(_log_key)
+        use_triton_decode = _use_triton_decode() and num_decodes > 0
 
         if self.compress_ratio <= 1:
-            attn_output = attn_op(
-                q,
-                ori_kv=swa_kv_cache,
-                ori_block_table=swa_decode_metadata.block_table,
-                cu_seqlens_q=actual_seq_lengths_query,
-                seqused_kv=actual_seq_lengths_key,
-                sinks=self.attn_sink,
-                metadata=swa_decode_metadata.sas_metadata,
-                softmax_scale=self.softmax_scale,
-                cmp_ratio=max(self.compress_ratio, 1),
-                ori_mask_mode=4,
-                ori_win_left=self.window_size - 1,
-                ori_win_right=0,
-                layout_q="TND",
-                layout_kv="PA_ND",
-                **extra_attn_kwargs,
-            )[0]
+            if use_triton_decode:
+                attn_output = _triton_decode_c4(
+                    q=q,
+                    swa_kv_cache=swa_kv_cache,
+                    compress_kv_cache=None,
+                    cmp_sparse_indices=None,
+                    ori_block_table=swa_decode_metadata.block_table,
+                    cmp_block_table=None,
+                    seqused_kv=actual_seq_lengths_key,
+                    sinks=self.attn_sink,
+                    softmax_scale=self.softmax_scale,
+                    compress_ratio=self.compress_ratio,
+                    ori_block_size=swa_decode_metadata.block_size,
+                    cmp_block_size=None,
+                    ori_window_size=self.window_size,
+                    query_start_loc=actual_seq_lengths_query,
+                    max_query_tokens=self.decode_threshold,
+                )
+            else:
+                attn_output = attn_op(
+                    q,
+                    ori_kv=swa_kv_cache,
+                    ori_block_table=swa_decode_metadata.block_table,
+                    cu_seqlens_q=actual_seq_lengths_query,
+                    seqused_kv=actual_seq_lengths_key,
+                    sinks=self.attn_sink,
+                    metadata=swa_decode_metadata.sas_metadata,
+                    softmax_scale=self.softmax_scale,
+                    cmp_ratio=max(self.compress_ratio, 1),
+                    ori_mask_mode=4,
+                    ori_win_left=self.window_size - 1,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_ND",
+                    **extra_attn_kwargs,
+                )[0]
         elif self.compress_ratio == 4:
             # Optional Triton path: replace ascend-c attn_op with a triton
             # kernel when VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE=1.
@@ -2702,6 +2702,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                     ori_block_size=swa_decode_metadata.block_size,
                     cmp_block_size=compressor_decode_metadata.block_size,
                     ori_window_size=self.window_size,
+                    query_start_loc=actual_seq_lengths_query,
+                    max_query_tokens=self.decode_threshold,
                 )
             else:
                 if self.enable_dsa_triton_decode:
@@ -2762,6 +2764,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                     ori_block_size=swa_decode_metadata.block_size,
                     cmp_block_size=compressor_decode_metadata.block_size,
                     ori_window_size=self.window_size,
+                    query_start_loc=actual_seq_lengths_query,
+                    max_query_tokens=self.decode_threshold,
                 )
             else:
                 if self.enable_dsa_triton_decode_c128:
